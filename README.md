@@ -32,7 +32,7 @@ Goshawk ETL es un pipeline robusto para descarga, procesamiento y análisis de d
 
 1. **Clonar repositorio**:
 ```bash
-git clone https://github.com/Kimedes/goshawk_ETL.git
+git clone https://github.com/Kimedes-Artificial-Intelligence/goshawk_ETL.git
 cd goshawk_ETL
 ```
 
@@ -366,8 +366,8 @@ Este proyecto está bajo licencia MIT. Ver archivo [LICENSE](LICENSE) para más 
 
 ## 📧 Contacto
 
-- **Organización**: [Kimedes](https://github.com/Kimedes)
-- **Issues**: [GitHub Issues](https://github.com/Kimedes/goshawk_ETL/issues)
+- **Organización**: [Kimedes Artificial Intelligence](https://github.com/Kimedes-Artificial-Intelligence)
+- **Issues**: [GitHub Issues](https://github.com/Kimedes-Artificial-Intelligence/goshawk_ETL/issues)
 
 ---
 
