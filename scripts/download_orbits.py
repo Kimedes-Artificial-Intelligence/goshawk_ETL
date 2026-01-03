@@ -142,7 +142,15 @@ def download_orbit_file(
                 try:
                     doc = xmltodict.parse(orbit_content)
                 except Exception as e:
-                    return False, f"XML inválido: {e}", dates_covered
+                    # XML corrupto, registrar y continuar con siguiente
+                    logger.warning(f"   ⚠️  XML corrupto: {orbit_filename}")
+                    logger.warning(f"       Error: {str(e)[:100]}")
+                    
+                    # Eliminar archivo descargado parcialmente si existe
+                    if snap_orbit_path.exists():
+                        snap_orbit_path.unlink()
+                    
+                    return False, f"XML corrupto: {str(e)[:100]}", dates_covered
 
                 # Guardar directamente en SNAP (archivo .EOF descomprimido)
                 temp_path = str(snap_orbit_path) + '.tmp'
@@ -245,7 +253,11 @@ def download_orbits_for_period(
                         total_downloaded += 1
                     elif error:
                         total_errors += 1
-                        logger.info(f"      Error en {orbit_file}: {error}")
+                        if "XML corrupto" in error:
+                            logger.warning(f"      ⚠️  {orbit_file}: {error}")
+                            logger.warning(f"          Servidor devolvió archivo corrupto - reintenta más tarde")
+                        else:
+                            logger.info(f"      Error en {orbit_file}: {error}")
 
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 404:
@@ -344,6 +356,13 @@ Ejemplos:
     # Workflow completion message
     if total_errors == 0:
         logger.info(f"\n✅ Descarga completada exitosamente")
+    else:
+        logger.info(f"\n⚠️  Completado con {total_errors} errores")
+        logger.info(f"   Los archivos corruptos pueden deberse a:")
+        logger.info(f"   - Problemas temporales en el servidor ESA")
+        logger.info(f"   - Archivos aún no publicados oficialmente")
+        logger.info(f"   💡 Solución: Reintenta la descarga más tarde")
+        logger.info(f"   El script detectará automáticamente qué falta")
 
     return 0 if total_errors == 0 else 1
 
