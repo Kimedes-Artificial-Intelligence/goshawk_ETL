@@ -1,0 +1,53 @@
+name: goshawk_etl
+channels:
+  - conda-forge
+  - terradue
+  - defaults
+dependencies:
+  # Python 3.12 (compatible con esa_snappy y SNAP 13, mejor rendimiento)
+  # esa_snappy soporta Python 3.9-3.12
+  - python=3.12
+
+  # SNAP Python interface (se instalará via pip después de SNAP)
+  # esa_snappy será instalado por el script install_snap.sh
+
+  # Geospatial libraries
+  - rasterio
+  - geopandas
+  - shapely
+  - fiona
+  - pyproj
+
+  # Scientific computing
+  - numpy
+  - scipy
+  - scikit-learn
+  - pandas
+
+  # Visualization
+  - matplotlib
+  - seaborn
+
+  # Image processing
+  - scikit-image
+  - opencv
+
+  # Data download
+  - requests
+
+  # Utilities
+  - tqdm
+  - pyyaml
+  - click
+
+  # Development tools
+  - jupyter
+  - ipython
+
+  # Pip packages (if not available in conda)
+  - pip
+  - pip:
+    # Packages only available via pip
+    - python-dotenv
+    - asf_search  # Alaska Satellite Facility
+    - xmltodict  # XML parsing for orbit files validation

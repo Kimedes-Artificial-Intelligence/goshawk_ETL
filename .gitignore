@@ -1,0 +1,154 @@
+# ============================================================================
+# PROPUESTA DE .gitignore PARA SUBIR RESULTADOS A GITHUB
+# ============================================================================
+# Este archivo mantiene el código y resultados finales, excluyendo:
+# - Datos crudos de satélite (323GB en data/)
+# - Archivos intermedios de procesamiento (21GB en processing/)
+# - Archivos pesados (.dim, .data, .SAFE)
+# ============================================================================
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+
+# Workflow state (contiene credenciales)
+.project_config.json
+.env
+
+# Installers
+Miniconda*.sh
+
+# ============================================================================
+# DATOS CRUDOS DE SATÉLITE (323 GB) - NUNCA SUBIR
+# ============================================================================
+data/
+
+# ============================================================================
+# DIRECTORIO DE PROCESAMIENTO - NO SUBIR
+# ============================================================================
+processing/
+*.zip
+*.SAFE/
+*.EOF
+
+# ============================================================================
+# ARCHIVOS INTERMEDIOS DE PROCESAMIENTO (21 GB)
+# ============================================================================
+
+# Enlaces simbólicos a datos crudos
+processing/*/slc/
+processing/*/grd/
+processing/*/*/slc/
+processing/*/*/grd/
+
+# Productos preprocesados SLC/GRD (archivos .dim + .data)
+processing/*/preprocessed_slc/
+processing/*/preprocessed_grd/
+processing/*/*/preprocessed_slc/
+processing/*/*/preprocessed_grd/
+
+# Archivos SNAP pesados (.dim son XML pero vienen con carpetas .data enormes)
+*.dim
+*.data/
+
+# Interferogramas individuales (pesados, solo guardar estadísticas)
+processing/*/interferograms/*.dim
+processing/*/interferograms/*.data/
+processing/*/interferograms/*.tif
+processing/*/*/fusion/insar/*.dim
+processing/*/*/fusion/insar/*.data/
+processing/*/*/fusion/insar/cropped/
+
+# IMPORTANTE: NO ignorar carpetas pairs/ (contienen resultados finales)
+# Las carpetas pairs/ contienen estadísticas por par temporal que queremos conservar
+!processing/*/*/fusion/pairs/
+!processing/*/*/fusion/pairs/**
+
+# Coherencia individual (pesados, solo guardar estadísticas)
+processing/*/coherence/*.dim
+processing/*/coherence/*.data/
+processing/*/coherence/*.tif
+
+# SAR compartido (symlinks)
+processing/*/*/fusion/sar
+
+# Estadísticas intermedias en fusion/ (se regeneran)
+processing/*/*/fusion/*.tif
+processing/*/*/fusion/coherence_*.tif
+processing/*/*/fusion/vv_*.tif
+processing/*/*/fusion/entropy_*.tif
+
+# Logs de procesamiento (muy verbosos, 100KB+)
+processing/*/logs/
+processing/*/*/logs/
+*.log
+
+# ============================================================================
+# ARCHIVOS A MANTENER EN GIT (ligeros y valiosos)
+# ============================================================================
+# Los siguientes archivos SÍ se subirán (no están ignorados):
+#
+# CONFIGURACIÓN DE PROYECTO:
+# - processing/*/aoi.geojson
+# - processing/*/config.txt
+# - processing/*/README.md
+# - processing/*/selected_products_*.json
+# - processing/*/processing_manifest_*.json
+# - processing/*/*/config.txt (configuración de series)
+#
+# RESULTADOS FINALES (ligeros):
+# - processing/*/*/fusion/*.tif (estadísticas temporales: coherence_mean, vv_std, entropy_mean)
+# - processing/*/*/fusion/*.json
+# - processing/*/*/fusion/*.txt
+# - processing/*/*/fusion/*.png
+#
+# CÓDIGO Y DOCUMENTACIÓN:
+# - Todos los archivos .py
+# - Todos los archivos .sh
+# - Todos los archivos .md
+# - environment.yml
+# - LICENSE
+# ============================================================================
+
+# Goshawk pipeline outputs
+outputs/
+goshawk/output/

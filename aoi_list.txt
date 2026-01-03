@@ -1,0 +1,65 @@
+# Lista de ejemplo de AOI para procesamiento batch
+# Un AOI por línea, sin extensión .geojson
+# Las líneas que comienzan con # son comentarios y se ignoran
+
+# Ciudades principales
+# abrera
+# agullana
+# arenys_de_munt
+# argentona
+# banyoles
+# barbera_del_valles
+# biure
+# borrassa
+# cabanelles
+# camos
+# cantallops
+# castellbisbal
+# collbato
+# corca
+# darnius
+# el_far_demporda
+# el_port_de_la_selva
+# el_prat_de_llobregat
+# espolla
+# esponella
+# figueres
+# fogars_de_la_selva
+# fortia
+# gallifa
+# hostalric
+
+# la_selva_de_mar
+# la_tallada_demporda
+# la_vajol
+# llado
+# macanet_de_cabrenys
+# masarac_i_vilarnadal
+# massanes
+# olesa_de_montserrat
+# osor
+# palol_de_revardit
+# porqueres
+# salt
+# sarria_de_ter
+# santa_maria_de_palautordera
+# sant_feliu_de_buixalleu
+sant_iscle_de_vallalta
+# sant_julia_del_llor_i_bonmati
+# sant_llorenc_savall
+# sant_miquel_de_fluvia
+# sarria_de_ter
+# saus_camallera_i_llampaies
+# sort
+# susqueda
+# torroella_de_fluvia
+# vacarisses
+# verges
+# vidreres
+# vilademuls
+# vilafant
+# vilalba_sasserra
+# vilamalla
+# vila_sacra
+# vilassar_de_mar
+la_llacuna
