@@ -1623,23 +1623,36 @@ Ejemplos:
     # Actualizar lista de productos a descargar
     products = products_to_download
 
-    # Verificar espacio
-    free_gb = shutil.disk_usage('..').free / (1024 ** 3)
-    logger.info(f" Espacio disponible: {free_gb:.1f} GB")
-    if total_size > free_gb:
-        logger.info("❌ Espacio insuficiente para descargar todos los productos")
-        return 1
-
-    if args.search_only:
-        logger.info(" Búsqueda completa")
-        return 0
-
-    # Descargar
+    # Preparar directorio de descarga
     download_dir = os.path.join(
         BASE_DIR,
         f"{args.collection.lower().replace('-', '')}_{args.product_type.lower()}"
     )
+    
+    # Verificar espacio en el directorio de descarga (puede ser un enlace simbólico a NAS)
+    try:
+        free_gb = shutil.disk_usage(download_dir).free / (1024 ** 3)
+        logger.info(f"💾 Espacio disponible en {download_dir}: {free_gb:.1f} GB")
+    except FileNotFoundError:
+        # Si el directorio no existe aún, verificar el padre
+        parent_dir = os.path.dirname(download_dir)
+        if not os.path.exists(parent_dir):
+            parent_dir = BASE_DIR
+        free_gb = shutil.disk_usage(parent_dir).free / (1024 ** 3)
+        logger.info(f"💾 Espacio disponible en {parent_dir}: {free_gb:.1f} GB")
+    
+    if total_size > free_gb:
+        logger.info("❌ Espacio insuficiente para descargar todos los productos")
+        logger.info(f"   Necesitas: {total_size:.1f} GB")
+        logger.info(f"   Disponible: {free_gb:.1f} GB")
+        logger.info(f"   Faltante: {total_size - free_gb:.1f} GB")
+        return 1
 
+    if args.search_only:
+        logger.info("✓ Búsqueda completa")
+        return 0
+
+    # Descargar (download_dir ya está definido arriba)
     stats = download_all_products(products, auth, download_dir, args.product_type, args.yes, args.orbit_direction)
 
     return 0 if stats['failed'] == 0 else 1
