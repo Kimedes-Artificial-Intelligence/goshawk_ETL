@@ -11,9 +11,12 @@ NOTA SOBRE VALIDACIÓN DE DATOS:
 - La intersección de bbox desde annotation es suficiente y confiable
 - Para detectar problemas de cobertura real, usar post-validación en calculate_pair_statistics.py
 
-Analiza todos los productos SLC disponibles y determina qué sub-swath (IW1, IW2, IW3)
+Analiza todos los productos SLC disponibles y determina qué sub-swath (IW1, IW2)
 tiene la mejor cobertura del AOI. Luego selecciona el producto SLC apropiado para cada 
 fecha basándose en ese sub-swath óptimo.
+
+NOTA: IW3 se EXCLUYE automáticamente por alta distorsión y sombras en terreno urbano,
+especialmente problemático para detección de humedad del subsuelo.
 
 VALIDACIÓN DE COBERTURA:
 - ✅ Intersección geométrica de bounding boxes (desde annotation/*.xml)
@@ -262,9 +265,11 @@ def get_manifest_path(product_dir):
 def extract_subswaths_from_manifest(manifest_path):
     """
     Extrae los sub-swaths disponibles del archivo manifest.safe.
+    
+    NOTA: Solo procesa IW1 e IW2 (IW3 excluido por sombras en terreno urbano)
 
     Returns:
-        set: Conjunto de sub-swaths disponibles (e.g., {'IW1', 'IW2', 'IW3'})
+        set: Conjunto de sub-swaths disponibles (e.g., {'IW1', 'IW2'})
     """
     try:
         import re
@@ -281,9 +286,9 @@ def extract_subswaths_from_manifest(manifest_path):
             if 'dataobjectpointer' in elem.tag.lower():
                 obj_id = elem.get('dataObjectID', '').lower()
                 
-                # Buscar patrones como iw1slc, iw2slc, iw3slc en el ID
+                # Buscar patrones como iw1slc, iw2slc en el ID (excluir iw3)
                 if 'slc' in obj_id and 'iw' in obj_id:
-                    match = re.search(r'iw(\d)slc', obj_id)
+                    match = re.search(r'iw([12])slc', obj_id)  # Solo IW1 e IW2
                     if match:
                         swath_num = match.group(1)
                         subswath = f'IW{swath_num}'

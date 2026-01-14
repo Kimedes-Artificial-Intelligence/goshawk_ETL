@@ -2,7 +2,7 @@
 """
 Script: preprocess_products.py
 Descripción: Pre-procesa productos Sentinel-1 con PyroSAR: recorte al AOI y creación de mosaicos
-Uso: 
+Uso:
   python scripts/preprocess_products.py [--grd|--slc] [--insar-mode]
 
 Modos de preprocesamiento:
@@ -16,7 +16,35 @@ CORRECCIONES APLICADAS (2024-12-23/24):
   ✓ Eliminada restricción artificial de IW3 (todos los subswaths son válidos)
   ✓ Procesamiento secuencial (evita Out-Of-Memory: GPT ya paraleliza internamente)
   ✓ Agregado Apply-Orbit-File en modo InSAR (según workflow oficial ESA/SNAP)
-  
+
+OPTIMIZACIONES (2026-01-13):
+  ✓ Sistema de caché global de SLC preprocesados (evita reprocesamiento)
+  ✓ Reutilización automática de productos en data/preprocessed_slc/
+  ✓ Creación de symlinks para productos cacheados (ahorro de espacio)
+  ✓ Procesamiento incremental: solo preprocesa lo que falta
+
+SISTEMA DE CACHÉ GLOBAL:
+  El script ahora busca productos preprocesados en data/preprocessed_slc/ antes de procesar.
+
+  Estructura de caché:
+    data/preprocessed_slc/{orbit}_{subswath}/t{track}/{fecha}/producto_split.dim
+
+  Ejemplo:
+    data/preprocessed_slc/desc_iw1/t110/20250717/SLC_20250717_..._split.dim
+
+  Beneficios:
+    • Evita reprocesar productos ya procesados en otros workspaces
+    • Ahorra tiempo: ~5-10 min por producto
+    • Ahorra espacio: usa symlinks en lugar de copias
+    • Caché actual: ~947 productos preprocesados disponibles
+
+  Funcionamiento:
+    1. Detecta órbita/subswath del directorio de salida (desc_iw1, asc_iw2, etc.)
+    2. Busca en data/preprocessed_slc/{orbit}_{subswath}/
+    3. Para cada producto .SAFE, busca por fecha en todas las carpetas t*
+    4. Si encuentra el .dim correspondiente, crea symlink (tanto .dim como .data)
+    5. Solo preprocesa los productos que NO están en caché
+
 IMPORTANTE - Modo InSAR (según tutoriales oficiales ESA):
   ⚠️  NO se aplica Subset geográfico en preprocesamiento InSAR
   ⚠️  Razón: SLC está en geometría radar (slant-range), no geográfica
@@ -25,10 +53,11 @@ IMPORTANTE - Modo InSAR (según tutoriales oficiales ESA):
 
 Este script:
 1. Identifica productos Sentinel-1 descargados
-2. Recorta productos al AOI usando PyroSAR
-3. Aplica TOPSAR-Deburst solo en modo SAR normal (NO en modo InSAR)
-4. Crea mosaicos de productos que cubren la misma fecha/órbita
-5. Guarda productos pre-procesados listos para procesamiento SAR/InSAR
+2. Verifica caché global y reutiliza productos preprocesados (modo InSAR)
+3. Recorta productos al AOI usando PyroSAR
+4. Aplica TOPSAR-Deburst solo en modo SAR normal (NO en modo InSAR)
+5. Crea mosaicos de productos que cubren la misma fecha/órbita
+6. Guarda productos pre-procesados listos para procesamiento SAR/InSAR
 """
 
 import argparse
@@ -584,12 +613,18 @@ def subset_product(product_path, aoi_wkt, output_dir, insar_mode=False, subswath
     """
     Recorta un producto al AOI usando SNAP/GPT directamente (solo subset, sin procesamiento)
 
+    IMPORTANTE: Para modo InSAR, el parámetro 'subswath' es CRÍTICO y debe ser
+    consistente para todos los productos de una serie. Esto asegura que los pares
+    InSAR tengan el mismo subswath en master y slave (requisito de SNAP Back-Geocoding).
+
     Args:
         product_path: Ruta al producto .SAFE
-        aoi_wkt: AOI en formato WKT (opcional en modo InSAR sin AOI)
+        aoi_wkt: AOI en formato WKT (opcional en modo InSAR)
         output_dir: Directorio de salida para producto recortado
         insar_mode: Si True, no aplica TOPSAR-Deburst (mantiene estructura de bursts para InSAR)
-        subswath: Subswath específico (IW1/IW2/IW3) para modo InSAR sin AOI
+        subswath: Subswath específico (IW1/IW2/IW3). En modo InSAR, todos los productos
+                 de una serie DEBEN usar el mismo subswath. Si no se especifica y hay AOI,
+                 se auto-detecta (NO RECOMENDADO para InSAR).
 
     Returns:
         str: Ruta al producto recortado o None si falla
@@ -846,20 +881,206 @@ def process_single_product(args_tuple):
         args_tuple: (index, total, product, aoi_wkt, output_dir, insar_mode, subswath_from_dir)
 
     Returns:
-        tuple: (product_name, success)
+        tuple: (product_name, success, index)
     """
     index, total, product, aoi_wkt, output_dir, insar_mode, subswath_from_dir = args_tuple
 
-    # Importar logger y función subset_product localmente
-    from processing_utils import logger
+    # Configurar logger local para este proceso
     import os
+    import sys
+    from pathlib import Path
+
+    # Asegurar que el path contiene scripts/
+    sys.path.insert(0, str(Path(__file__).parent))
+    from logging_utils import LoggerConfig
+
+    # Logger local para este proceso
+    proc_logger = LoggerConfig.setup_script_logger(
+        script_name=f'preprocess_worker_{os.getpid()}',
+        log_dir='logs',
+        level=20,  # INFO
+        console_level=30  # WARNING - menos verbose
+    )
 
     product_name = os.path.basename(product)[:60]
-    logger.info(f"[{index}/{total}] {product_name}...")
+    proc_logger.info(f"[{index}/{total}] Procesando: {product_name}")
 
-    result = subset_product(product, aoi_wkt, output_dir, insar_mode=insar_mode, subswath=subswath_from_dir)
+    try:
+        result = subset_product(product, aoi_wkt, output_dir, insar_mode=insar_mode, subswath=subswath_from_dir)
+        if result:
+            proc_logger.info(f"[{index}/{total}] ✓ Completado: {product_name}")
+        else:
+            proc_logger.error(f"[{index}/{total}] ✗ Falló: {product_name}")
+        return (product_name, result, index)
+    except Exception as e:
+        proc_logger.error(f"[{index}/{total}] ✗ Error: {product_name}: {e}")
+        return (product_name, None, index)
 
-    return product_name, result
+
+def check_global_preprocessed_cache(output_dir, products, insar_mode=False):
+    """
+    Busca SLC preprocesados en la caché global data/preprocessed_slc/
+
+    La caché global tiene la estructura:
+        data/preprocessed_slc/{orbit}_{subswath}/t{track}/{fecha}/producto_split.dim
+
+    Args:
+        output_dir: Directorio de salida local (para determinar órbita/subswath)
+        products: Lista de productos .SAFE a preprocesar
+        insar_mode: Si True, busca productos en modo InSAR
+
+    Returns:
+        dict: {
+            'found_products': {product_path: cache_dim_path},
+            'missing_products': [product_paths],
+            'cache_dir': Path
+        }
+    """
+    from pathlib import Path
+
+    # Convertir a ruta absoluta si es relativa
+    output_dir_abs = os.path.abspath(output_dir)
+
+    # Detectar órbita y subswath del directorio de salida
+    # Formato esperado: .../preprocessed_slc/desc_iw1/ o .../arenys_de_munt/insar_desc_iw1/preprocessed_slc/
+    output_basename = os.path.basename(output_dir_abs.rstrip('/'))
+    parent_basename = os.path.basename(os.path.dirname(output_dir_abs.rstrip('/')))
+
+    logger.debug(f"  Detectando órbita/subswath:")
+    logger.debug(f"    output_dir (input): {output_dir}")
+    logger.debug(f"    output_dir_abs: {output_dir_abs}")
+    logger.debug(f"    output_basename: {output_basename}")
+    logger.debug(f"    parent_basename: {parent_basename}")
+
+    orbit = None
+    subswath = None
+
+    # Buscar patrón desc_iw1, asc_iw2, insar_desc_iw1, etc.
+    for name in [output_basename, parent_basename]:
+        match = re.search(r'(?:insar_)?(desc|asc)_(iw[123])', name)
+        if match:
+            orbit = match.group(1)
+            subswath = match.group(2).upper()
+            logger.debug(f"    ✓ Match en '{name}': orbit={orbit}, subswath={subswath}")
+            break
+        else:
+            logger.debug(f"    ✗ No match en '{name}'")
+
+    if not orbit or not subswath:
+        logger.info("  No se pudo detectar órbita/subswath del directorio, omitiendo caché global")
+        return {
+            'found_products': {},
+            'missing_products': products,
+            'cache_dir': None
+        }
+
+    # Buscar en caché global
+    repo_root = Path(__file__).parent.parent  # /home/jmiro/Github/goshawk_ETL
+    cache_base = repo_root / 'data' / 'preprocessed_slc' / f'{orbit}_{subswath}'
+
+    if not cache_base.exists():
+        logger.info(f"  Caché global no existe: {cache_base}")
+        return {
+            'found_products': {},
+            'missing_products': products,
+            'cache_dir': None
+        }
+
+    logger.info(f"🔍 Buscando en caché global: {cache_base}")
+
+    found_products = {}
+    missing_products = []
+
+    for product in products:
+        # Extraer fecha del producto
+        basename = os.path.basename(product)
+        date_match = re.search(r'_(\d{8})T\d{6}_', basename)
+        if not date_match:
+            missing_products.append(product)
+            continue
+
+        date = date_match.group(1)
+
+        # Buscar en todas las carpetas t* (tracks)
+        found = False
+        for track_dir in cache_base.glob('t*'):
+            date_dir = track_dir / date
+            if date_dir.exists():
+                # Buscar archivos .dim en este directorio
+                dim_files = list(date_dir.glob('*_split.dim'))
+                if dim_files:
+                    # Tomar el primero (debería haber solo uno)
+                    cache_dim = dim_files[0]
+                    found_products[product] = cache_dim
+                    logger.info(f"  ✓ Encontrado en caché: {date} → {cache_dim.name}")
+                    found = True
+                    break
+
+        if not found:
+            missing_products.append(product)
+
+    logger.info(f"  Productos en caché: {len(found_products)}/{len(products)}")
+    logger.info(f"  Productos a preprocesar: {len(missing_products)}")
+
+    return {
+        'found_products': found_products,
+        'missing_products': missing_products,
+        'cache_dir': cache_base
+    }
+
+
+def create_symlinks_from_cache(cache_result, output_dir):
+    """
+    Crea symlinks en output_dir para los productos encontrados en caché
+
+    Args:
+        cache_result: Resultado de check_global_preprocessed_cache()
+        output_dir: Directorio donde crear los symlinks
+
+    Returns:
+        int: Número de symlinks creados
+    """
+    from pathlib import Path
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    symlinks_created = 0
+
+    for product_safe, cache_dim in cache_result['found_products'].items():
+        # Crear symlink para el .dim
+        link_dim = output_path / cache_dim.name
+
+        # Si ya existe, verificar si apunta al mismo archivo
+        if link_dim.exists() or link_dim.is_symlink():
+            if link_dim.is_symlink() and link_dim.resolve() == cache_dim.resolve():
+                logger.debug(f"  Symlink ya existe: {link_dim.name}")
+                continue
+            else:
+                # Eliminar symlink antiguo
+                link_dim.unlink()
+
+        # Crear symlink
+        link_dim.symlink_to(cache_dim.absolute())
+        logger.info(f"  🔗 Symlink creado: {link_dim.name} → {cache_dim}")
+
+        # Crear también symlink para la carpeta .data asociada
+        cache_data = cache_dim.with_suffix('.data')
+        if cache_data.exists() and cache_data.is_dir():
+            link_data = output_path / cache_data.name
+
+            if link_data.exists() or link_data.is_symlink():
+                if link_data.is_symlink() and link_data.resolve() == cache_data.resolve():
+                    continue
+                else:
+                    link_data.unlink()
+
+            link_data.symlink_to(cache_data.absolute())
+            logger.debug(f"  🔗 Symlink .data creado: {link_data.name}")
+
+        symlinks_created += 1
+
+    return symlinks_created
 
 
 def preprocess_products(product_dir, output_dir, aoi_wkt, product_type='GRD', create_mosaics=False, insar_mode=False):
@@ -881,15 +1102,18 @@ def preprocess_products(product_dir, output_dir, aoi_wkt, product_type='GRD', cr
     elif product_type == 'SLC':
         logger.info("MODO: SAR Normal (con TOPSAR-Deburst)")
     logger.info("=" * 80)
-    
-    # Detectar subswath del nombre del directorio (para modo InSAR sin AOI)
+
+    # Detectar subswath del nombre del directorio (para modo InSAR)
+    # IMPORTANTE: En InSAR, todos los productos de una serie DEBEN usar el mismo subswath
+    # para que Back-Geocoding funcione correctamente (requiere master/slave con mismo subswath)
     subswath_from_dir = None
-    if insar_mode and not aoi_wkt:
+    if insar_mode:
         # Formato: data/preprocessed_slc_insar/desc_iw1/ → IW1
         match = re.search(r'_(iw[123])$', os.path.basename(output_dir.rstrip('/')))
         if match:
             subswath_from_dir = match.group(1).upper()  # IW1, IW2, IW3
-            logger.info(f"Subswath detectado del directorio: {subswath_from_dir}")
+            logger.info(f"Subswath configurado para la serie: {subswath_from_dir}")
+            logger.info(f"  Todos los productos usarán {subswath_from_dir} consistentemente")
 
     # Buscar productos
     pattern = os.path.join(product_dir, 'S1*_IW_SLC__*.SAFE')
@@ -900,10 +1124,50 @@ def preprocess_products(product_dir, output_dir, aoi_wkt, product_type='GRD', cr
         return
 
     logger.info(f"Encontrados {len(products)} productos {product_type}")
-    logger.info(f"  {len(products)} productos para pre-procesar")
 
     # Crear directorio de salida
     os.makedirs(output_dir, exist_ok=True)
+
+    # OPTIMIZACIÓN: Verificar caché global antes de preprocesar
+    cache_result = None
+    symlinks_created = 0
+
+    if product_type == 'SLC' and insar_mode:
+        logger.info("")
+        logger.info("=" * 80)
+        logger.info("VERIFICANDO CACHÉ GLOBAL DE SLC PREPROCESADOS")
+        logger.info("=" * 80)
+
+        cache_result = check_global_preprocessed_cache(output_dir, products, insar_mode)
+
+        if cache_result['found_products']:
+            logger.info(f"📦 Productos encontrados en caché: {len(cache_result['found_products'])}")
+            symlinks_created = create_symlinks_from_cache(cache_result, output_dir)
+            logger.info(f"🔗 Symlinks creados: {symlinks_created}")
+
+            # Actualizar lista de productos a solo los faltantes
+            products = cache_result['missing_products']
+
+            if not products:
+                logger.info("")
+                logger.info("=" * 80)
+                logger.info("🎉 TODOS los productos encontrados en caché global!")
+                logger.info("=" * 80)
+                logger.info(f"  Productos reutilizados: {symlinks_created}")
+                logger.info(f"  Productos pre-procesados guardados en: {output_dir}")
+                logger.info("")
+                return
+            else:
+                logger.info(f"")
+                logger.info(f"⚙️  Preprocesamiento incremental:")
+                logger.info(f"  • Productos en caché: {len(cache_result['found_products'])}")
+                logger.info(f"  • Productos a preprocesar: {len(products)}")
+                logger.info("")
+        else:
+            logger.info(f"  No se encontraron productos en caché, preprocesando todos...")
+            logger.info("")
+
+    logger.info(f"Productos para pre-procesar: {len(products)}")
 
     # Para SLC: agrupar por fecha y seleccionar mejor burst
     # (no crear mosaicos, pero sí seleccionar el burst con mejor cobertura)
@@ -969,6 +1233,8 @@ def preprocess_products(product_dir, output_dir, aoi_wkt, product_type='GRD', cr
         processed = 0
         failed = 0
 
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
         for (date, orbit), group_products in groups.items():
             logger.info(f"[{date} órbita {orbit:03d}]")
 
@@ -978,19 +1244,30 @@ def preprocess_products(product_dir, output_dir, aoi_wkt, product_type='GRD', cr
                 if result:
                     processed += 1
                 else:
-                    # CORRECCIÓN: Procesar secuencialmente para evitar conflictos de memoria
-                    # GPT ya paraleliza internamente con -c 4G
-                    logger.info("  Procesando productos individualmente (secuencial para evitar OOM)...")
+                    # Procesar productos individualmente con PARALELIZACIÓN (2 workers)
+                    logger.info("  Procesando productos individualmente (2 procesos paralelos)...")
 
-                    for i, product in enumerate(group_products, 1):
-                        product_name = os.path.basename(product)[:60]
-                        logger.info(f"    [{i}/{len(group_products)}] {product_name}...")
-                        
-                        result = subset_product(product, aoi_wkt, output_dir, insar_mode=insar_mode, subswath=subswath_from_dir)
-                        if result:
-                            processed += 1
-                        else:
-                            failed += 1
+                    args_list = [
+                        (i, len(group_products), product, aoi_wkt, output_dir, insar_mode, subswath_from_dir)
+                        for i, product in enumerate(group_products, 1)
+                    ]
+
+                    with ProcessPoolExecutor(max_workers=2) as executor:
+                        futures = {executor.submit(process_single_product, args): args[2] for args in args_list}
+
+                        for future in as_completed(futures):
+                            try:
+                                product_name, result, index = future.result()
+                                if result:
+                                    logger.info(f"    [{index}/{len(group_products)}] ✓ {product_name[:60]}")
+                                    processed += 1
+                                else:
+                                    logger.warning(f"    [{index}/{len(group_products)}] ✗ {product_name[:60]}")
+                                    failed += 1
+                            except Exception as e:
+                                product_path = futures[future]
+                                logger.error(f"    ✗ Error: {os.path.basename(product_path)}: {e}")
+                                failed += 1
             else:
                 # Producto individual
                 result = subset_product(group_products[0], aoi_wkt, output_dir, insar_mode=insar_mode, subswath=subswath_from_dir)
@@ -1000,34 +1277,61 @@ def preprocess_products(product_dir, output_dir, aoi_wkt, product_type='GRD', cr
                     failed += 1
 
     else:
-        # Procesar todos individualmente (SECUENCIAL para evitar conflictos de memoria)
+        # Procesar todos individualmente (PARALELO con 2 workers)
         logger.info("Procesando productos individualmente (sin mosaicos)...")
-        logger.info("⚙️  Modo secuencial: GPT ya paraleliza internamente")
-        logger.info("   (evita Out-Of-Memory cuando múltiples GPT compiten por recursos)")
+        logger.info("⚙️  Modo PARALELO: 2 procesos simultáneos")
+        logger.info("   (equilibrio entre velocidad y uso de memoria)")
         logger.info("")
 
         processed = 0
         failed = 0
 
-        # Procesar secuencialmente
-        for i, product in enumerate(products, 1):
-            product_name = os.path.basename(product)[:60]
-            logger.info(f"[{i}/{len(products)}] {product_name}...")
-            
-            result = subset_product(product, aoi_wkt, output_dir, insar_mode=insar_mode, subswath=subswath_from_dir)
-            if result:
-                processed += 1
-            else:
-                failed += 1
+        # Preparar argumentos para paralelización
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        args_list = [
+            (i, len(products), product, aoi_wkt, output_dir, insar_mode, subswath_from_dir)
+            for i, product in enumerate(products, 1)
+        ]
+
+        # Procesar con 2 workers en paralelo
+        with ProcessPoolExecutor(max_workers=2) as executor:
+            # Enviar todas las tareas
+            futures = {executor.submit(process_single_product, args): args[2] for args in args_list}
+
+            # Procesar resultados a medida que se completan
+            for future in as_completed(futures):
+                try:
+                    product_name, result, index = future.result()
+                    if result:
+                        logger.info(f"[{index}/{len(products)}] ✓ {product_name[:60]}")
+                        processed += 1
+                    else:
+                        logger.warning(f"[{index}/{len(products)}] ✗ {product_name[:60]}")
+                        failed += 1
+                except Exception as e:
+                    product_path = futures[future]
+                    logger.error(f"✗ Excepción procesando {os.path.basename(product_path)}: {e}")
+                    failed += 1
 
     # Resumen
     logger.info("")
     logger.info("=" * 80)
     logger.info("RESUMEN PRE-PROCESAMIENTO")
     logger.info("=" * 80)
-    logger.info(f"Productos procesados correctamente: {processed}")
-    logger.info(f"Productos fallidos: {failed}")
-    logger.info(f"Total: {len(products)}")
+
+    # Incluir estadísticas de caché si se utilizó
+    if cache_result and cache_result['found_products']:
+        logger.info(f"Productos reutilizados de caché: {symlinks_created}")
+        logger.info(f"Productos procesados localmente: {processed}")
+        logger.info(f"Productos fallidos: {failed}")
+        total_with_cache = symlinks_created + len(products)
+        logger.info(f"Total: {total_with_cache} ({symlinks_created} caché + {len(products)} procesados)")
+    else:
+        logger.info(f"Productos procesados correctamente: {processed}")
+        logger.info(f"Productos fallidos: {failed}")
+        logger.info(f"Total: {len(products)}")
+
     logger.info(f"Productos pre-procesados guardados en: {output_dir}")
     logger.info("")
 

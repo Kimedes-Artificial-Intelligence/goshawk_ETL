@@ -193,7 +193,7 @@ def create_insar_workflow_xml(
       <demName>Copernicus 30m Global DEM</demName>
       <demResamplingMethod>BILINEAR_INTERPOLATION</demResamplingMethod>
       <imgResamplingMethod>BILINEAR_INTERPOLATION</imgResamplingMethod>
-      <pixelSpacingInMeter>15.0</pixelSpacingInMeter>
+      <pixelSpacingInMeter>10.0</pixelSpacingInMeter>
       <mapProjection>WGS84(DD)</mapProjection>
       <alignToStandardGrid>false</alignToStandardGrid>
       <nodataValueAtSea>true</nodataValueAtSea>
@@ -392,7 +392,7 @@ def create_insar_workflow_xml(
       <demName>Copernicus 30m Global DEM</demName>
       <demResamplingMethod>BILINEAR_INTERPOLATION</demResamplingMethod>
       <imgResamplingMethod>BILINEAR_INTERPOLATION</imgResamplingMethod>
-      <pixelSpacingInMeter>15.0</pixelSpacingInMeter>
+      <pixelSpacingInMeter>10.0</pixelSpacingInMeter>
       <mapProjection>WGS84(DD)</mapProjection>
       <alignToStandardGrid>false</alignToStandardGrid>
       <nodataValueAtSea>true</nodataValueAtSea>
@@ -498,110 +498,114 @@ def process_pair_with_gpt(
     slave_path: Union[Path, str],
     output_path: Union[Path, str],
     is_preprocessed: bool = False,
-    aoi_wkt: Optional[str] = None
+    aoi_wkt: Optional[str] = None,
+    configured_subswath: str = 'IW2'
 ) -> bool:
     """
-    Procesa un par InSAR usando GPT con fallback de IW1 a IW2
+    Procesa un par InSAR usando GPT con el sub-swath configurado
 
-    Intenta procesar primero con IW1. Si falla (por ejemplo, por recorte AOI),
-    automáticamente reintenta con IW2.
+    IMPORTANTE: Para InSAR, el master y slave deben tener el MISMO subswath.
+    Esta función NO realiza fallback automático a otros subswaths, ya que
+    esto es técnicamente incorrecto según los requisitos de SNAP Back-Geocoding.
+
+    Args:
+        master_path: Ruta al producto master
+        slave_path: Ruta al producto slave
+        output_path: Ruta de salida del producto InSAR
+        is_preprocessed: Si los productos ya están preprocesados
+        aoi_wkt: AOI en formato WKT (opcional)
+        configured_subswath: Sub-swath a usar (IW1/IW2/IW3), default IW2
 
     Returns:
         True si el procesamiento fue exitoso, False en caso contrario
     """
-    # Lista de sub-swaths a intentar: primero IW1, luego IW2 como fallback
-    subswaths_to_try = ['IW1', 'IW2']
+    # Validate that master and slave are different products
+    master_path_str = str(master_path)
+    slave_path_str = str(slave_path)
 
-    for attempt, subswath in enumerate(subswaths_to_try, 1):
+    if master_path_str == slave_path_str:
+        logger.error(f"  ✗ Error: Master and slave are the same product: {Path(master_path).name}")
+        return False
+
+    # Extract dates to validate they're different (prevent same-date interferograms)
+    master_date = extract_date_from_filename(Path(master_path).name)
+    slave_date = extract_date_from_filename(Path(slave_path).name)
+
+    if master_date == slave_date:
+        logger.error(f"  ✗ Error: Master and slave have the same date: {master_date}")
+        logger.error(f"    Master: {Path(master_path).name}")
+        logger.error(f"    Slave: {Path(slave_path).name}")
+        return False
+
+    subswath = configured_subswath
+
+    try:
+        logger.info(f"  → Procesando con sub-swath: {subswath}")
+
+        # Crear XML
+        xml = create_insar_workflow_xml(master_path, slave_path, output_path, is_preprocessed, aoi_wkt, subswath)
+
+        # Guardar XML temporal
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.xml', delete=False) as tf:
+            tf.write(xml)
+            xml_file = tf.name
+
         try:
-            if attempt > 1:
-                logger.info(f"  🔄 Reintentando con {subswath} como fallback...")
-            else:
-                logger.info(f"  → Procesando con sub-swath: {subswath}")
+            # Ejecutar GPT
+            logger.info("  ⚙️  Ejecutando GPT...")
+            logger.info(f"  → Workflow: {'Pre-procesado' if is_preprocessed else 'Completo'}")
 
-            # Crear XML
-            xml = create_insar_workflow_xml(master_path, slave_path, output_path, is_preprocessed, aoi_wkt, subswath)
+            result = subprocess.run(
+                ['gpt', xml_file, '-c', '8G'],
+                capture_output=True,
+                text=True,
+                timeout=3600  # 60 min timeout (InSAR es más lento)
+            )
 
-            # Guardar XML temporal
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.xml', delete=False) as tf:
-                tf.write(xml)
-                xml_file = tf.name
+            # Validar el resultado
+            if result.returncode != 0:
+                logger.error(f"  ✗ Error en GPT con {subswath} (exit code {result.returncode})")
+                if result.stderr:
+                    # Guardar error completo en archivo para depuración
+                    error_file = f"/tmp/gpt_error_{subswath}_{os.getpid()}.log"
+                    with open(error_file, 'w') as f:
+                        f.write(result.stderr)
+                    logger.error(f"  Error completo guardado en: {error_file}")
 
-            try:
-                # Ejecutar GPT
-                logger.info("  ⚙️  Ejecutando GPT...")
-                logger.info(f"  → Workflow: {'Pre-procesado' if is_preprocessed else 'Completo'}")
+                    # Buscar la causa raíz del error
+                    stderr_lines = result.stderr.strip().split('\n')
 
-                result = subprocess.run(
-                    ['gpt', xml_file, '-c', '8G'],
-                    capture_output=True,
-                    text=True,
-                    timeout=3600  # 60 min timeout (InSAR es más lento)
-                )
+                    # Buscar líneas "Caused by" o "Error:" que contienen el error real
+                    error_lines = [line for line in stderr_lines if 'Caused by:' in line or 'Error:' in line or 'Exception' in line]
 
-                # Validar el resultado
-                if result.returncode != 0:
-                    logger.error(f"  ✗ Error en GPT con {subswath} (exit code {result.returncode})")
-                    if result.stderr:
-                        # Guardar error completo en archivo para depuración
-                        error_file = f"/tmp/gpt_error_{subswath}_{os.getpid()}.log"
-                        with open(error_file, 'w') as f:
-                            f.write(result.stderr)
-                        logger.error(f"  Error completo guardado en: {error_file}")
+                    if error_lines:
+                        logger.error("Errores encontrados:")
+                        for line in error_lines[:10]:  # Primeros 10 errores
+                            logger.error(f"  {line.strip()}")
 
-                        # Buscar la causa raíz del error
-                        stderr_lines = result.stderr.strip().split('\n')
-
-                        # Buscar líneas "Caused by" o "Error:" que contienen el error real
-                        error_lines = [line for line in stderr_lines if 'Caused by:' in line or 'Error:' in line or 'Exception' in line]
-
-                        if error_lines:
-                            logger.error("Errores encontrados:")
-                            for line in error_lines[:10]:  # Primeros 10 errores
-                                logger.error(f"  {line.strip()}")
-
-                    # Si hay más sub-swaths para intentar, continuar al siguiente
-                    if attempt < len(subswaths_to_try):
-                        logger.warning(f"  ⚠️  {subswath} falló, intentando siguiente sub-swath...")
-                        continue
-                    else:
-                        return False
-
-                # GPT retornó exit code 0, pero verificar que realmente generó datos
-                logger.info("  → Validando salida del procesamiento...")
-                if not validate_insar_output(output_path):
-                    logger.error(f"  ✗ GPT con {subswath} completó pero no generó datos válidos")
-                    logger.error("  Esto puede deberse a:")
-                    logger.error("    - Memoria insuficiente durante el procesamiento")
-                    logger.error("    - Corrupción de datos de entrada")
-                    logger.error("    - Bug en SNAP/GPT")
-
-                    # Si hay más sub-swaths para intentar, continuar al siguiente
-                    if attempt < len(subswaths_to_try):
-                        logger.warning(f"  ⚠️  {subswath} no generó datos válidos, intentando siguiente sub-swath...")
-                        continue
-                    else:
-                        return False
-
-                logger.info(f"  ✅ Procesamiento exitoso con {subswath}")
-                return True
-
-            finally:
-                # Limpiar XML temporal
-                if os.path.exists(xml_file):
-                    os.unlink(xml_file)
-
-        except Exception as e:
-            logger.error(f"  ✗ Error con {subswath}: {e}")
-            # Si hay más sub-swaths para intentar, continuar al siguiente
-            if attempt < len(subswaths_to_try):
-                logger.warning(f"  ⚠️  Excepción con {subswath}, intentando siguiente sub-swath...")
-                continue
-            else:
                 return False
 
-    # Si llegamos aquí, todos los intentos fallaron
-    return False
+            # GPT retornó exit code 0, pero verificar que realmente generó datos
+            logger.info("  → Validando salida del procesamiento...")
+            if not validate_insar_output(output_path):
+                logger.error(f"  ✗ GPT con {subswath} completó pero no generó datos válidos")
+                logger.error("  Esto puede deberse a:")
+                logger.error("    - Memoria insuficiente durante el procesamiento")
+                logger.error("    - Corrupción de datos de entrada")
+                logger.error("    - Bug en SNAP/GPT")
+                return False
+
+            logger.info(f"  ✅ Procesamiento exitoso con {subswath}")
+            return True
+
+        finally:
+            # Limpiar XML temporal
+            if os.path.exists(xml_file):
+                os.unlink(xml_file)
+
+    except Exception as e:
+        logger.error(f"  ✗ Error con {subswath}: {e}")
+        return False
 
 
 def generate_insar_pairs(
@@ -650,13 +654,43 @@ def generate_insar_pairs(
 
 def create_pol_decomposition_xml(
         input_path: Union[Path, str],
-        output_path: Union[Path, str]
+        output_path: Union[Path, str],
+        is_preprocessed: bool = False
 ) -> str:
     """
     Crea XML para descomposición H/A/Alpha Dual-Pol en Sentinel-1.
 
-    Workflow: Read -> Calibration -> Pol-Speckle-Filter -> Pol-Decomposition -> Terrain-Correction -> Write
+    Workflow para productos preprocesados (.dim):
+      Read -> Calibration -> Pol-Speckle-Filter -> Pol-Decomposition -> Terrain-Correction -> Write
+
+    Workflow para productos originales (.SAFE):
+      Read -> Apply-Orbit-File -> Calibration -> Pol-Speckle-Filter -> Pol-Decomposition -> Terrain-Correction -> Write
+
+    Args:
+        input_path: Ruta al producto SLC
+        output_path: Ruta de salida
+        is_preprocessed: True si el producto ya tiene Apply-Orbit-File (productos .dim preprocesados)
     """
+
+    # Determinar nodo fuente para Calibration
+    calibration_source = "Read" if is_preprocessed else "Apply-Orbit-File"
+
+    # Nodo opcional Apply-Orbit-File (solo para productos originales)
+    apply_orbit_node = "" if is_preprocessed else """
+  <!-- Apply-Orbit-File MUST be applied for correct geolocation of original products -->
+  <node id="Apply-Orbit-File">
+    <operator>Apply-Orbit-File</operator>
+    <sources>
+      <sourceProduct refid="Read"/>
+    </sources>
+    <parameters>
+      <orbitType>Sentinel Precise (Auto Download)</orbitType>
+      <polyDegree>3</polyDegree>
+      <continueOnFail>false</continueOnFail>
+    </parameters>
+  </node>
+"""
+
     xml = f"""<graph id="S1_Polarimetric_Decomposition">
   <version>1.0</version>
 
@@ -667,16 +701,16 @@ def create_pol_decomposition_xml(
       <file>{input_path}</file>
     </parameters>
   </node>
-
+{apply_orbit_node}
   <!-- Calibration MUST be applied before TOPSAR-Deburst for Sentinel-1 TOPS data -->
   <node id="Calibration">
     <operator>Calibration</operator>
     <sources>
-      <sourceProduct refid="Read"/>
+      <sourceProduct refid="{calibration_source}"/>
     </sources>
     <parameters>
       <sourceBands/>
-      <auxFile>Product Auxiliary File</auxFile>
+      <auxFile>Latest Auxiliary File</auxFile>
       <externalAuxFile/>
       <outputImageInComplex>true</outputImageInComplex> <outputImageScaleInDb>false</outputImageScaleInDb>
       <createGammaBand>false</createGammaBand>
@@ -734,7 +768,8 @@ def create_pol_decomposition_xml(
       <demName>Copernicus 30m Global DEM</demName>
       <demResamplingMethod>BILINEAR_INTERPOLATION</demResamplingMethod>
       <imgResamplingMethod>BILINEAR_INTERPOLATION</imgResamplingMethod>
-      <pixelSpacingInMeter>15.0</pixelSpacingInMeter> <mapProjection>WGS84(DD)</mapProjection>
+      <pixelSpacingInMeter>10.0</pixelSpacingInMeter>
+      <mapProjection>WGS84(DD)</mapProjection>
       <alignToStandardGrid>false</alignToStandardGrid>
       <nodataValueAtSea>true</nodataValueAtSea>
       <saveDEM>false</saveDEM>
@@ -793,17 +828,16 @@ def main() -> int:
     output_dir = config.get('OUTPUT_DIR', 'processed')
     aoi_wkt = config.get('AOI', None)
 
+    # Leer configuración de órbita y sub-swath (necesario siempre, no solo para repositorio)
+    orbit_direction = config.get('ORBIT_DIRECTION', 'DESCENDING')
+    subswath = config.get('SUBSWATH', 'IW2')  # Default IW2 en lugar de IW1
+
     # Configurar repositorio si está habilitado
     repository = None
-    orbit_direction = None
-    subswath = None
     track_number = None
 
     if args.use_repository or args.save_to_repository:
         repository = InSARRepository()
-        # Obtener orbit/subswath del config
-        orbit_direction = config.get('ORBIT_DIRECTION', 'DESCENDING')
-        subswath = config.get('SUBSWATH', 'IW1')
         logger.info(f"\n📦 Repositorio habilitado: {orbit_direction} {subswath}")
 
 
@@ -928,7 +962,7 @@ def main() -> int:
         else:
             logger.info(f"  → Tipo: Original (.SAFE) or MERGED (requiere TOPSAR-Split)")
 
-        success = process_pair_with_gpt(master, slave, output_file, is_preprocessed=is_preprocessed, aoi_wkt=aoi_wkt)
+        success = process_pair_with_gpt(master, slave, output_file, is_preprocessed=is_preprocessed, aoi_wkt=aoi_wkt, configured_subswath=subswath)
 
         if success:
             logger.info(f"  ✅ Completado: {output_file}")
@@ -953,6 +987,38 @@ def main() -> int:
                             shutil.copytree(output_data, dest_data, dirs_exist_ok=True)
 
                         logger.info(f"  📦 Guardado en repositorio: track {track_number}/{pair_subdir}/")
+
+                        # OPTIMIZACIÓN: Reemplazar archivos locales por symlinks para ahorrar espacio
+                        try:
+                            # Verificar que la copia al repositorio fue exitosa
+                            dest_data = dest_file.with_suffix('.data')
+                            if dest_file.exists() and dest_data.exists():
+                                # Calcular tamaño para logging
+                                local_size_mb = Path(output_file).stat().st_size / (1024 * 1024)
+
+                                # Eliminar archivos locales
+                                logger.debug(f"  🗑️  Eliminando producto local para ahorrar espacio...")
+                                local_file = Path(output_file)
+                                local_data = Path(output_file).with_suffix('.data')
+
+                                if local_file.exists() and not local_file.is_symlink():
+                                    local_file.unlink()
+                                    logger.debug(f"    ✓ Eliminado: {local_file.name}")
+
+                                if local_data.exists() and not local_data.is_symlink():
+                                    shutil.rmtree(local_data)
+                                    logger.debug(f"    ✓ Eliminado: {local_data.name}/")
+
+                                # Crear symlinks desde workspace → repositorio
+                                local_file.symlink_to(dest_file.absolute())
+                                local_data.symlink_to(dest_data.absolute())
+
+                                logger.info(f"  🔗 Symlinks creados: workspace → repositorio (~{local_size_mb:.0f} MB ahorrados)")
+                            else:
+                                logger.warning(f"  ⚠️  Copia al repositorio incompleta - manteniendo archivos locales")
+                        except Exception as e:
+                            logger.warning(f"  ⚠️  Error creando symlinks: {e}")
+                            logger.warning(f"  Producto guardado en repositorio pero duplicado en workspace")
 
                         # Actualizar metadata
                         metadata = repository.load_metadata(orbit_direction, subswath, track_number)

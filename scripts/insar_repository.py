@@ -104,6 +104,32 @@ class InSARRepository:
         logger.debug(f"SLC {basename}: Satellite={satellite}, AbsOrbit={absolute_orbit}, Track={relative_orbit}")
         return relative_orbit
 
+    def extract_date_from_slc(self, slc_filename: str) -> Optional[str]:
+        """
+        Extrae fecha del nombre de archivo SLC Sentinel-1
+        
+        Formato: S1[ABC]_IW_SLC__1SDV_YYYYMMDDTHHMMSS_YYYYMMDDTHHMMSS_AAAAAA_BBBBBB_CCCC
+                                         ^^^^^^^^
+                                      Fecha de inicio
+        
+        Args:
+            slc_filename: Nombre del archivo SLC (puede incluir path)
+        
+        Returns:
+            Fecha en formato YYYYMMDD o None si falla
+        """
+        # Extraer solo el basename
+        basename = os.path.basename(slc_filename)
+        
+        # Pattern Sentinel-1 SLC
+        pattern = r'S1[ABC]_IW_SLC__1S\w+_(\d{8})T\d{6}_'
+        match = re.search(pattern, basename)
+        
+        if match:
+            return match.group(1)  # YYYYMMDD
+        
+        return None
+
     def get_track_dir(self, orbit_direction: str, subswath: str, track: int) -> Path:
         """
         Obtiene directorio para orbit/subswath/track

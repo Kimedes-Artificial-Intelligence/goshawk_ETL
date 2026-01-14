@@ -188,14 +188,19 @@ def group_products_by_series(analysis):
         for product in products:
             subswaths_with_coverage.update(product['subswaths_covering_aoi'])
 
+    # FILTRAR: Solo procesar IW1 e IW2 (excluir IW3 por sombras urbanas)
+    subswaths_with_coverage = {sw for sw in subswaths_with_coverage if sw in ['IW1', 'IW2']}
+
     if not subswaths_with_coverage:
-        logger.info("⚠️  Ningún sub-swath tiene cobertura del AOI")
+        logger.info("⚠️  Ningún sub-swath IW1/IW2 tiene cobertura del AOI")
+        logger.info("    (IW3 excluido automáticamente por sombras en terreno urbano)")
         return {}
 
     logger.info("\n" + "=" * 80)
     logger.info("AGRUPACIÓN DE PRODUCTOS EN SERIES POR SUB-SWATH")
     logger.info("=" * 80)
     logger.info(f"Sub-swaths con cobertura del AOI: {sorted(subswaths_with_coverage)}")
+    logger.info(f"Nota: IW3 excluido automáticamente (alta distorsión/sombras en terreno urbano)")
 
     # Crear series para cada sub-swath
     series = {}

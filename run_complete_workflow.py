@@ -548,13 +548,8 @@ def process_series(project_name, config_json, series_name, use_repository=True, 
     logger.info(f"PROCESANDO SERIE: {series_name}")
     logger.info(f"{'~' * 80}")
 
-    # Verificar si ya está procesado (verificar productos finales recortados)
-    cropped_dir = output_dir / "fusion" / "insar" / "cropped"
-    if cropped_dir.exists():
-        cropped_files = list(cropped_dir.glob("Ifg_*_cropped.tif"))
-        if len(cropped_files) > 0:
-            logger.info(f"✓ Serie ya procesada ({len(cropped_files)} productos finales), saltando...")
-            return True
+    # NOTA: La verificación de productos finales completos se hace dentro de
+    # process_insar_series.py, no es necesario duplicarla aquí
 
     # Ejecutar process_insar_series.py con --full-pipeline
     cmd = [
@@ -706,11 +701,12 @@ def run_processing(project_name, orbit_direction, use_repository=True, save_to_r
         logger.info(f"  - {cf.name}")
     logger.info("")
 
-    # ESTRATEGIA REPOSITORIO: Procesar TODAS las IW disponibles
+    # ESTRATEGIA REPOSITORIO: Procesar SOLO IW1 e IW2
+    # IW3 se excluye por alta distorsión y sombras en terreno urbano (humedad subsuelo)
     # Cada IW se guarda al repositorio para reutilización futura
     # Beneficio: Otros proyectos pueden usar cualquier combinación de IWs
 
-    logger.info(f"Estrategia: Procesar TODAS las subswaths disponibles (IW1, IW2, IW3)")
+    logger.info(f"Estrategia: Procesar SOLO IW1 e IW2 (IW3 excluido por sombras urbanas)")
     logger.info(f"Cada subswath se guarda al repositorio compartido para reutilización")
     logger.info("")
 
@@ -719,9 +715,23 @@ def run_processing(project_name, orbit_direction, use_repository=True, save_to_r
     processed_iws = []  # IWs que se procesaron exitosamente
     failed_iws = []     # IWs sin cobertura del AOI
 
-    # Ordenar configs por prioridad: IW1 → IW2 → IW3 (para logging ordenado)
-    iw_priority = {'iw1': 1, 'iw2': 2, 'iw3': 3}
-    config_files_sorted = sorted(config_files, key=lambda cf: iw_priority.get(
+    # Filtrar solo IW1 e IW2 (excluir IW3)
+    config_files_filtered = [cf for cf in config_files 
+                            if cf.stem.replace("selected_products_", "").split('_')[-1].lower() in ['iw1', 'iw2']]
+    
+    if not config_files_filtered:
+        logger.error(f"✗ No se encontraron configuraciones IW1/IW2 para {orbit_direction}")
+        return False
+    
+    logger.info(f"Subswaths a procesar: {len(config_files_filtered)} (IW1, IW2)")
+    for cf in config_files_filtered:
+        iw = cf.stem.replace("selected_products_", "").split('_')[-1].upper()
+        logger.info(f"  - {cf.name} → {iw}")
+    logger.info("")
+
+    # Ordenar configs por prioridad: IW1 → IW2
+    iw_priority = {'iw1': 1, 'iw2': 2}
+    config_files_sorted = sorted(config_files_filtered, key=lambda cf: iw_priority.get(
         cf.stem.replace("selected_products_", "").split('_')[-1].lower(), 99
     ))
 

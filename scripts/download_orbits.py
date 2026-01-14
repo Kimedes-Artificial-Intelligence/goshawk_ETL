@@ -354,17 +354,28 @@ Ejemplos:
     logger.info(f"📦 Backup en: {ORBITS_DIR}")
 
     # Workflow completion message
+    total_attempts = total_downloaded + total_errors
+    error_rate = (total_errors / total_attempts * 100) if total_attempts > 0 else 0
+
     if total_errors == 0:
         logger.info(f"\n✅ Descarga completada exitosamente")
-    else:
-        logger.info(f"\n⚠️  Completado con {total_errors} errores")
+        return 0
+    elif error_rate < 10.0:
+        # Pocos errores (< 10%) - considerarlo éxito con advertencia
+        logger.info(f"\n⚠️  Descarga exitosa con {total_errors} errores menores ({error_rate:.1f}%)")
+        logger.info(f"   {total_downloaded} órbitas descargadas correctamente")
         logger.info(f"   Los archivos corruptos pueden deberse a:")
         logger.info(f"   - Problemas temporales en el servidor ESA")
         logger.info(f"   - Archivos aún no publicados oficialmente")
         logger.info(f"   💡 Solución: Reintenta la descarga más tarde")
         logger.info(f"   El script detectará automáticamente qué falta")
-
-    return 0 if total_errors == 0 else 1
+        return 0  # Éxito - los errores menores no deberían detener el workflow
+    else:
+        # Muchos errores (>= 10%) - fallar
+        logger.error(f"\n✗ Descarga falló con {total_errors} errores ({error_rate:.1f}%)")
+        logger.error(f"   Solo {total_downloaded} órbitas descargadas correctamente")
+        logger.error(f"   Tasa de error demasiado alta - verifica conectividad")
+        return 1  # Error - demasiados fallos
 
 if __name__ == "__main__":
     try:

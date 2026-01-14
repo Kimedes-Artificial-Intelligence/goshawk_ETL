@@ -50,6 +50,9 @@ from insar_repository import InSARRepository
 # Logger se configurará después de crear el workspace
 logger = None
 
+# Info de productos finales (para preprocesamiento selectivo)
+final_products_info = None
+
 
 def load_series_config(config_file):
     """Carga configuración de la serie desde JSON"""
@@ -404,10 +407,279 @@ def check_and_setup_orbits(workspace):
     return True
 
 
-def run_preprocessing(workspace, config_file):
+def check_missing_products(workspace, series_config, repository=None):
+    """
+    Verifica qué productos finales (InSAR, polarimetría) ya existen en el repositorio
+    y determina qué falta procesar.
+
+    Esta función implementa la optimización: si TODO ya está procesado, no necesitamos
+    preprocesar ni procesar nada, solo hacer crop al AOI.
+
+    Args:
+        workspace: Diccionario con rutas del workspace
+        series_config: Configuración de la serie (orbit, subswath, products, etc.)
+        repository: InSARRepository instance (opcional)
+
+    Returns:
+        dict: {
+            'all_exist': bool,  # Si todos los productos finales existen
+            'missing_pairs': List[tuple],  # Pares (master, slave, type) que faltan
+            'existing_pairs': List[tuple],  # Pares que ya existen
+            'required_slc_dates': Set[str],  # Fechas SLC necesarias (YYYYMMDD)
+            'existing_count': int,
+            'missing_count': int,
+            'track_number': int  # Track number del repositorio
+        }
+    """
+    logger.info(f"\n{'=' * 80}")
+    logger.info(f"VERIFICANDO PRODUCTOS EXISTENTES EN REPOSITORIO")
+    logger.info(f"{'=' * 80}\n")
+
+    # Inicializar resultado
+    result = {
+        'all_exist': False,
+        'missing_pairs': [],
+        'existing_pairs': [],
+        'required_slc_dates': set(),
+        'existing_count': 0,
+        'missing_count': 0,
+        'track_number': None
+    }
+
+    if not repository:
+        logger.info("  ℹ️  Repositorio no habilitado - procesamiento completo necesario")
+        # Generar todos los pares como faltantes
+        products = series_config.get('products', [])
+        dates = sorted([p['date'].replace('-', '') for p in products])
+
+        # Pares short (consecutivos)
+        for i in range(len(dates) - 1):
+            result['missing_pairs'].append((dates[i], dates[i+1], 'short'))
+            result['required_slc_dates'].add(dates[i])
+            result['required_slc_dates'].add(dates[i+1])
+
+        # Pares long (salto +2)
+        for i in range(len(dates) - 2):
+            result['missing_pairs'].append((dates[i], dates[i+2], 'long'))
+            result['required_slc_dates'].add(dates[i])
+            result['required_slc_dates'].add(dates[i+2])
+
+        result['missing_count'] = len(result['missing_pairs'])
+        return result
+
+    # Obtener configuración de la serie
+    orbit_direction = series_config.get('orbit_direction', 'DESCENDING')
+    subswath = series_config.get('subswath', 'IW2')
+    products = series_config.get('products', [])
+
+    if not products:
+        logger.warning("  ⚠️  No hay productos en la serie")
+        return result
+
+    # Obtener track number del primer producto
+    first_product = products[0]
+    track_number = first_product.get('relative_orbit')
+
+    if not track_number:
+        logger.warning("  ⚠️  No se pudo determinar track number - procesamiento completo necesario")
+        return result
+
+    result['track_number'] = track_number
+
+    logger.info(f"  Serie: {orbit_direction} {subswath} Track {track_number}")
+    logger.info(f"  Productos en serie: {len(products)}")
+
+    # Obtener directorio del track en el repositorio
+    try:
+        track_dir = repository.get_track_dir(orbit_direction, subswath, track_number)
+        logger.info(f"  Directorio repositorio: {track_dir}")
+    except Exception as e:
+        logger.warning(f"  ⚠️  Error accediendo repositorio: {e}")
+        return result
+
+    # Verificar si el directorio existe
+    if not track_dir.exists():
+        logger.info(f"  ℹ️  Track no existe en repositorio - procesamiento completo necesario")
+        # Generar todos los pares como faltantes
+        dates = sorted([p['date'].replace('-', '') for p in products])
+        for i in range(len(dates) - 1):
+            result['missing_pairs'].append((dates[i], dates[i+1], 'short'))
+        for i in range(len(dates) - 2):
+            result['missing_pairs'].append((dates[i], dates[i+2], 'long'))
+        result['missing_count'] = len(result['missing_pairs'])
+        return result
+
+    # Generar lista de todos los pares esperados
+    dates = sorted([p['date'].replace('-', '') for p in products])
+    expected_pairs = []
+
+    # Pares short (consecutivos)
+    for i in range(len(dates) - 1):
+        expected_pairs.append((dates[i], dates[i+1], 'short'))
+
+    # Pares long (salto +2)
+    for i in range(len(dates) - 2):
+        expected_pairs.append((dates[i], dates[i+2], 'long'))
+
+    logger.info(f"  Pares esperados: {len(expected_pairs)}")
+    logger.info(f"    - Short (consecutivos): {len(dates) - 1}")
+    logger.info(f"    - Long (salto +2): {len(dates) - 2}")
+
+    # Verificar qué pares existen en el repositorio
+    insar_short_dir = track_dir / "insar" / "short"
+    insar_long_dir = track_dir / "insar" / "long"
+
+    existing_products = set()
+
+    # Buscar en pares short
+    if insar_short_dir.exists():
+        for dim_file in insar_short_dir.glob("Ifg_*.dim"):
+            existing_products.add(dim_file.stem)
+
+    # Buscar en pares long
+    if insar_long_dir.exists():
+        for dim_file in insar_long_dir.glob("Ifg_*_LONG.dim"):
+            existing_products.add(dim_file.stem)
+
+    logger.info(f"  Productos existentes en repositorio: {len(existing_products)}")
+
+    # Clasificar pares
+    for master_date, slave_date, pair_type in expected_pairs:
+        # Construir nombre esperado del producto
+        if pair_type == 'short':
+            product_name = f"Ifg_{master_date}_{slave_date}"
+        else:  # long
+            product_name = f"Ifg_{master_date}_{slave_date}_LONG"
+
+        if product_name in existing_products:
+            result['existing_pairs'].append((master_date, slave_date, pair_type))
+            result['existing_count'] += 1
+        else:
+            result['missing_pairs'].append((master_date, slave_date, pair_type))
+            result['missing_count'] += 1
+            # Añadir SLC necesarios para este par
+            result['required_slc_dates'].add(master_date)
+            result['required_slc_dates'].add(slave_date)
+
+    # Determinar si todo existe
+    result['all_exist'] = (result['missing_count'] == 0)
+
+    logger.info(f"\n  RESUMEN:")
+    logger.info(f"    ✓ Pares existentes: {result['existing_count']}")
+    logger.info(f"    ✗ Pares faltantes: {result['missing_count']}")
+
+    if result['all_exist']:
+        logger.info(f"    🎉 TODOS los productos finales ya existen!")
+        logger.info(f"    → Se puede saltar preprocesamiento y procesamiento")
+    elif result['missing_count'] < len(expected_pairs):
+        logger.info(f"    → Procesamiento parcial: solo {result['missing_count']} pares")
+        logger.info(f"    → SLC necesarios: {len(result['required_slc_dates'])}")
+    else:
+        logger.info(f"    → Procesamiento completo necesario")
+
+    logger.info("")
+
+    return result
+
+
+def check_global_preprocessed_cache(series_config, required_slc_dates=None):
+    """
+    Busca SLC preprocesados en la caché global data/preprocessed_slc/
+
+    La caché global tiene la estructura:
+        data/preprocessed_slc/{orbit}_{subswath}/t{track}/{fecha}/producto_split.dim
+
+    Args:
+        series_config: Configuración de la serie (para orbit, subswath, track)
+        required_slc_dates: Set de fechas SLC necesarias (YYYYMMDD). Si None, no filtra.
+
+    Returns:
+        dict: {
+            'found_products': {fecha: Path_to_dim_file},  # SLC encontrados en caché
+            'missing_dates': Set[str],  # Fechas que faltan en caché
+            'cache_dir': Path  # Directorio de caché para este track
+        }
+    """
+    from pathlib import Path
+
+    result = {
+        'found_products': {},
+        'missing_dates': set(),
+        'cache_dir': None
+    }
+
+    # Obtener configuración
+    orbit_direction = series_config.get('orbit_direction', 'DESCENDING')
+    subswath = series_config.get('subswath', 'IW2')
+    products = series_config.get('products', [])
+
+    if not products:
+        return result
+
+    # Obtener track number
+    first_product = products[0]
+    track_number = first_product.get('relative_orbit')
+
+    if not track_number:
+        logger.debug("  No se pudo determinar track number para caché global")
+        return result
+
+    # Construir path a caché global
+    project_root = Path.cwd()
+    orbit_suffix = "desc" if orbit_direction == "DESCENDING" else "asce"
+    subswath_lower = subswath.lower()
+    cache_dir = project_root / "data" / "preprocessed_slc" / f"{orbit_suffix}_{subswath_lower}" / f"t{track_number:03d}"
+
+    result['cache_dir'] = cache_dir
+
+    if not cache_dir.exists():
+        logger.debug(f"  Caché global no existe: {cache_dir}")
+        if required_slc_dates:
+            result['missing_dates'] = required_slc_dates
+        return result
+
+    # Buscar productos en caché
+    logger.info(f"\n🔍 Buscando SLC preprocesados en caché global...")
+    logger.info(f"  Caché: {cache_dir}")
+
+    # Determinar fechas a buscar
+    if required_slc_dates:
+        dates_to_check = required_slc_dates
+    else:
+        dates_to_check = set(p['date'].replace('-', '') for p in products)
+
+    for date in sorted(dates_to_check):
+        date_dir = cache_dir / date
+
+        if date_dir.exists():
+            # Buscar archivos .dim en el directorio de fecha
+            dim_files = list(date_dir.glob("*.dim"))
+
+            if dim_files:
+                # Tomar el primer .dim encontrado
+                result['found_products'][date] = dim_files[0]
+                logger.info(f"  ✓ {date}: {dim_files[0].name}")
+            else:
+                result['missing_dates'].add(date)
+                logger.debug(f"  ✗ {date}: directorio existe pero sin .dim")
+        else:
+            result['missing_dates'].add(date)
+            logger.debug(f"  ✗ {date}: no encontrado")
+
+    if result['found_products']:
+        logger.info(f"\n  Resumen caché global:")
+        logger.info(f"    ✓ Encontrados: {len(result['found_products'])}")
+        logger.info(f"    ✗ Faltantes: {len(result['missing_dates'])}")
+    else:
+        logger.info(f"  ℹ️  No se encontraron SLC en caché global")
+
+    return result
+
+
+def run_preprocessing(workspace, config_file, required_slc_dates=None):
     """
     Ejecuta el pre-procesamiento de productos SLC para InSAR
-    
+
     Preprocesamiento local por proyecto con AOI específico:
     - Aplica TOPSAR-Split por subswath
     - Recorta al AOI del proyecto (Subset)
@@ -417,19 +689,122 @@ def run_preprocessing(workspace, config_file):
     Args:
         workspace: Diccionario con rutas del workspace
         config_file: Ruta al archivo de configuración
+        required_slc_dates: Set[str] opcional con fechas (YYYYMMDD) de SLC a preprocesar.
+                           Si None, preproces todos los SLC disponibles.
 
     Returns:
         bool: True si el pre-procesamiento fue exitoso
     """
     logger.info(f"\n{'=' * 80}")
-    logger.info(f"PASO 2: PRE-PROCESAMIENTO (TOPSAR-Split + Subset AOI)")
+    if required_slc_dates:
+        logger.info(f"PASO 2: PRE-PROCESAMIENTO SELECTIVO ({len(required_slc_dates)} SLC necesarios)")
+    else:
+        logger.info(f"PASO 2: PRE-PROCESAMIENTO (TOPSAR-Split + Subset AOI)")
     logger.info(f"{'=' * 80}\n")
 
-    # Verificar si ya existen productos pre-procesados
+    # OPTIMIZACIÓN: Buscar primero en caché global data/preprocessed_slc/
+    # Leer series_config desde config_file
+    series_config = {}
+    if config_file.exists():
+        with open(config_file, 'r') as f:
+            for line in f:
+                if '=' in line and not line.strip().startswith('#'):
+                    key, value = line.strip().split('=', 1)
+                    series_config[key] = value.strip('"')
+
+    # Obtener info para buscar en caché global
+    if not series_config:
+        # Fallback: intentar cargar desde workspace
+        config_json = workspace['base'].parent / 'selected_products.json'
+        if config_json.exists():
+            import json
+            with open(config_json) as f:
+                series_config = json.load(f)
+
+    cache_result = check_global_preprocessed_cache(series_config, required_slc_dates)
+
+    # Crear symlinks para productos encontrados en caché
+    if cache_result['found_products']:
+        logger.info(f"\n📦 Creando symlinks desde caché global...")
+        workspace['preprocessed'].mkdir(parents=True, exist_ok=True)
+
+        for date, dim_path in cache_result['found_products'].items():
+            # Crear symlink al .dim
+            target_name = dim_path.name
+            link_path = workspace['preprocessed'] / target_name
+
+            if not link_path.exists():
+                link_path.symlink_to(dim_path.absolute())
+                logger.info(f"  ✓ {date}: {target_name}")
+
+                # Symlink al .data
+                dim_data = dim_path.with_suffix('.data')
+                link_data = link_path.with_suffix('.data')
+                if dim_data.exists() and not link_data.exists():
+                    link_data.symlink_to(dim_data.absolute())
+
+        logger.info(f"\n  ✓ {len(cache_result['found_products'])} SLC obtenidos desde caché global")
+
+        # Actualizar required_slc_dates para solo procesar los faltantes
+        if required_slc_dates and cache_result['missing_dates']:
+            required_slc_dates = cache_result['missing_dates']
+            logger.info(f"  → Solo preprocesar {len(required_slc_dates)} SLC faltantes\n")
+        elif not cache_result['missing_dates']:
+            logger.info(f"  🎉 TODOS los SLC necesarios están en caché!")
+            logger.info(f"  → Saltando preprocesamiento completamente\n")
+            return True
+
+    # Verificar si ya existen productos pre-procesados (además de los de caché)
     existing_preprocessed = list(workspace['preprocessed'].glob('*.dim'))
     if len(existing_preprocessed) >= 1:
         logger.info(f"ℹ️  Ya existen {len(existing_preprocessed)} productos preprocesados")
         logger.info(f"   → Procesamiento incremental: solo se preprocesarán nuevos SLC\n")
+
+    # Si se especificaron fechas requeridas, filtrar SLC necesarios
+    temp_slc_dir = None
+    original_slc_path = workspace['slc']
+
+    if required_slc_dates:
+        logger.info(f"  Filtrando SLC por fechas requeridas: {sorted(required_slc_dates)}\n")
+
+        # Crear directorio temporal con symlinks solo a SLC necesarios
+        import tempfile
+        from processing_utils import extract_date_from_filename
+
+        temp_slc_dir = Path(tempfile.mkdtemp(prefix="slc_filtered_"))
+
+        # Buscar SLC que coincidan con las fechas requeridas
+        filtered_count = 0
+        for slc_path in workspace['slc'].glob('*.SAFE'):
+            date_str = extract_date_from_filename(slc_path.name)
+            if date_str and date_str[:8] in required_slc_dates:
+                # Crear symlink al SLC necesario
+                link_path = temp_slc_dir / slc_path.name
+                link_path.symlink_to(slc_path.absolute())
+                filtered_count += 1
+                logger.info(f"    ✓ Incluido: {slc_path.name[:60]}")
+
+        logger.info(f"\n  SLC filtrados: {filtered_count}/{len(list(workspace['slc'].glob('*.SAFE')))}")
+
+        # Temporalmente reemplazar el directorio SLC
+        workspace['slc'] = temp_slc_dir
+        
+        # IMPORTANTE: Actualizar config.txt para usar el directorio temporal
+        temp_config = workspace['base'] / 'config_incremental.txt'
+        
+        # Leer config original y modificar SLC_DIR
+        with open(config_file, 'r') as f_in:
+            with open(temp_config, 'w') as f_out:
+                for line in f_in:
+                    if line.startswith('SLC_DIR='):
+                        # Usar path absoluto al directorio temporal
+                        f_out.write(f'SLC_DIR="{temp_slc_dir.absolute()}"\n')
+                    else:
+                        f_out.write(line)
+        
+        # Usar config temporal
+        config_file = temp_config
+        logger.info(f"  ✓ Config temporal creado con SLC filtrados\n")
 
     # Comando de pre-procesamiento con --insar-mode
     # Rutas absolutas para ejecutar desde el workspace
@@ -442,7 +817,7 @@ def run_preprocessing(workspace, config_file):
         "--config", str(config_file.name)  # Nombre relativo (config.txt está en el workspace)
     ]
 
-    logger.info(f"Ejecutando: {' '.join(cmd)}\n")
+    logger.info(f"\nEjecutando: {' '.join(cmd)}\n")
 
     result = subprocess.run(
         cmd,
@@ -451,6 +826,12 @@ def run_preprocessing(workspace, config_file):
         text=True,
         cwd=str(workspace['base'])  # Ejecutar desde el workspace para que las rutas relativas funcionen
     )
+
+    # Limpiar directorio temporal y restaurar workspace
+    if temp_slc_dir:
+        import shutil
+        shutil.rmtree(temp_slc_dir, ignore_errors=True)
+        workspace['slc'] = original_slc_path
 
     # Mostrar salida
     if result.stdout:
@@ -471,7 +852,7 @@ def run_preprocessing(workspace, config_file):
 
 
 def run_insar_processing(workspace, config_file, series_config, use_preprocessed=False,
-                         use_repository=False, save_to_repository=False):
+                         use_repository=False, save_to_repository=False, missing_info=None):
     """
     Ejecuta el procesamiento InSAR para la serie
 
@@ -482,6 +863,7 @@ def run_insar_processing(workspace, config_file, series_config, use_preprocessed
         use_preprocessed: Si usar productos pre-procesados
         use_repository: Buscar productos en repositorio antes de procesar
         save_to_repository: Guardar productos al repositorio después de procesar
+        missing_info: Dict con información sobre productos faltantes (de check_missing_products)
 
     Returns:
         bool: True si el procesamiento fue exitoso
@@ -498,6 +880,20 @@ def run_insar_processing(workspace, config_file, series_config, use_preprocessed
     logger.info(f"  Workspace: {workspace['base']}")
     logger.info("")
 
+    # OPTIMIZACIÓN: Si todos los productos ya existen, saltar procesamiento
+    if missing_info and missing_info.get('all_exist', False):
+        logger.info(f"🎉 TODOS los productos InSAR ya existen en el repositorio!")
+        logger.info(f"  ✓ {missing_info['existing_count']} pares ya procesados")
+        logger.info(f"  → Saltando procesamiento InSAR completamente\n")
+        return True
+
+    # Si hay procesamiento parcial, informar
+    if missing_info and missing_info.get('missing_count', 0) > 0:
+        logger.info(f"  ℹ️  Procesamiento parcial necesario:")
+        logger.info(f"     ✓ {missing_info['existing_count']} pares ya en repositorio")
+        logger.info(f"     ✗ {missing_info['missing_count']} pares por procesar")
+        logger.info(f"  → Solo se procesarán los pares faltantes\n")
+
     # VERIFICACIÓN CRÍTICA: Si se solicita usar preprocesados, verificar que existen
     if use_preprocessed:
         preprocessed_files = list(workspace['preprocessed'].glob('*.dim'))
@@ -510,21 +906,22 @@ def run_insar_processing(workspace, config_file, series_config, use_preprocessed
             logger.warning(f"  Productos requeridos: >= 2")
             logger.warning("")
             logger.warning(f"  → Ejecutando preprocesamiento automáticamente...\n")
-            
-            # Ejecutar preprocesamiento
-            preprocessing_success = run_preprocessing(workspace, config_file)
-            
+
+            # Ejecutar preprocesamiento (solo SLC necesarios si tenemos missing_info)
+            required_slc_dates = missing_info.get('required_slc_dates') if missing_info else None
+            preprocessing_success = run_preprocessing(workspace, config_file, required_slc_dates=required_slc_dates)
+
             if not preprocessing_success:
                 logger.error(f"✗ Preprocesamiento falló - abortando InSAR")
                 return False
-            
+
             # Verificar de nuevo
             preprocessed_files = list(workspace['preprocessed'].glob('*.dim'))
             if len(preprocessed_files) < 2:
                 logger.error(f"✗ Aún no hay suficientes productos preprocesados")
                 logger.error(f"  Se encontraron {len(preprocessed_files)} productos, se necesitan al menos 2")
                 return False
-            
+
             logger.info(f"✓ Preprocesamiento completado: {len(preprocessed_files)} productos\n")
 
     # Log file
@@ -991,21 +1388,35 @@ def cleanup_intermediate_files(workspace, series_config):
 def cleanup_invalid_subswath(workspace, series_config):
     """
     Elimina un subswath inválido (sin cobertura) del directorio de procesamiento.
+    Incluye limpieza de archivos intermedios (preprocessed_slc) antes de eliminar.
     """
     base_dir = workspace['base']
     subswath = series_config.get('subswath', 'unknown')
     orbit = series_config.get('orbit_direction', 'unknown')
     
-
-    
     logger.info(f"\nEliminando subswath inválido...")
     logger.info(f"  Directorio: {base_dir}")
     
     try:
-        # Eliminar todo el directorio del subswath (workspace local)
+        # PASO 1: Limpiar archivos intermedios primero (preprocessed_slc)
+        # Importante: Si hay symlinks a caché global, solo eliminar el link, no el destino
+        preprocessed_slc = workspace.get('preprocessed')
+        if preprocessed_slc and preprocessed_slc.exists():
+            if preprocessed_slc.is_symlink():
+                # Symlink a caché global - solo eliminar el link
+                preprocessed_slc.unlink()
+                logger.info(f"  ✓ Symlink eliminado (caché global preservada)")
+            elif preprocessed_slc.is_dir():
+                # Directorio local - eliminar contenido
+                size_bytes = sum(f.stat().st_size for f in preprocessed_slc.rglob('*') if f.is_file())
+                shutil.rmtree(preprocessed_slc)
+                size_mb = size_bytes / (1024 * 1024)
+                logger.info(f"  ✓ preprocessed_slc eliminado ({size_mb:.1f} MB)")
+        
+        # PASO 2: Eliminar todo el directorio del subswath
         if os.path.exists(base_dir):
             shutil.rmtree(base_dir)
-            logger.info(f"✓ Subswath eliminado")
+            logger.info(f"✓ Subswath completo eliminado")
             logger.info(f"  ✅ Caché global preservada (no afectada)")
             
             # Crear archivo de documentación sobre por qué se eliminó
@@ -1099,7 +1510,7 @@ def run_polarimetric_processing(workspace, series_config, use_repository=False, 
         save_to_repository: Guardar productos al repositorio después de procesar
     """
     logger.info(f"\n{'=' * 80}")
-    logger.info(f"PASO EXTRA: DESCOMPOSICIÓN POLARIMÉTRICA (H/A/Alpha)")
+    logger.info(f"PROCESAMIENTO POLARIMÉTRICO (H/A/Alpha)")
     logger.info(f"{'=' * 80}\n")
 
     # Usar directorio de salida polarimetría
@@ -1114,31 +1525,160 @@ def run_polarimetric_processing(workspace, series_config, use_repository=False, 
         orbit_direction = series_config.get('orbit_direction', 'DESCENDING')
         subswath = series_config.get('subswath', 'IW1')
         logger.info(f"📦 Repositorio polarimetría habilitado: {orbit_direction} {subswath}")
+        logger.info(f"   Buscando productos existentes antes de procesar...")
 
-    # Buscar productos SLC (usamos los preprocesados .dim si existen, si no los links SLC)
-    # NOTA: Para polarimetría necesitamos las bandas complejas (i_VV, q_VV, i_VH, q_VH).
-    # Los preprocesados de InSAR (--insar-mode) tienen esto.
-    input_dir = workspace['preprocessed']
-    products = list(input_dir.glob('*.dim'))
+    # ESTRATEGIA DE BÚSQUEDA (jerarquía):
+    # 1. Productos polarimétricos YA PROCESADOS en data/processed_products/
+    # 2. SLC preprocesados en data/preprocessed_slc/ (para procesar polarimetría)
+    # 3. SLC preprocesados locales en workspace['preprocessed']
+    # 4. SLC originales (último recurso)
     
+    # Extraer track primero (lo necesitamos para buscar en repositorio)
+    track_number = None
+    orbit_direction = series_config.get('orbit_direction', 'DESCENDING')
+    subswath = series_config.get('subswath', 'IW1')
+    
+    # Detectar track desde productos SLC disponibles
+    slc_links = list(workspace['slc'].glob('*.SAFE'))
+    if repository and slc_links:
+        track_number = repository.extract_track_from_slc(str(slc_links[0]))
+        if track_number:
+            logger.info(f"📡 Track detectado: {track_number}\n")
+    
+    # PASO 1: Buscar productos polarimétricos YA PROCESADOS en repositorio
+    all_products_in_repo = False
+    if repository and use_repository and track_number:
+        logger.info(f"🔍 PASO 1: Verificando productos polarimétricos en repositorio...")
+        
+        try:
+            repo_track_dir = repository.get_track_dir(orbit_direction, subswath, track_number)
+            repo_pol_dir = repo_track_dir / "polarimetry"
+            
+            if repo_pol_dir.exists():
+                # Contar cuántos productos polarimétricos hay en el repositorio
+                repo_dates = [d.name for d in repo_pol_dir.iterdir() if d.is_dir()]
+                slc_dates = [repository.extract_date_from_slc(str(slc)) for slc in slc_links]
+                slc_dates = [d for d in slc_dates if d]  # Filtrar None
+                
+                # Verificar si todos los SLC tienen producto polarimétrico
+                missing_dates = set(slc_dates) - set(repo_dates)
+                
+                if not missing_dates:
+                    logger.info(f"   ✓ TODOS los productos polarimétricos están en repositorio ({len(slc_dates)} productos)")
+                    logger.info(f"   → Creando symlinks desde repositorio...\n")
+                    
+                    # Crear symlinks para TODOS los productos
+                    workspace['polarimetry'].mkdir(parents=True, exist_ok=True)
+                    created = 0
+                    
+                    for date in slc_dates:
+                        date_dir = repo_pol_dir / date
+                        repo_products = list(date_dir.glob("*_HAAlpha.dim"))
+                        
+                        if repo_products:
+                            repo_file = repo_products[0]
+                            local_file = workspace['polarimetry'] / repo_file.name
+                            
+                            if not local_file.exists():
+                                local_file.symlink_to(repo_file.absolute())
+                                
+                            # Symlink .data
+                            repo_data = repo_file.with_suffix('.data')
+                            local_data = local_file.with_suffix('.data')
+                            if repo_data.exists() and not local_data.exists():
+                                local_data.symlink_to(repo_data.absolute())
+                            
+                            created += 1
+                    
+                    logger.info(f"   ✓ {created} symlinks de productos polarimétricos creados")
+                    all_products_in_repo = True
+                    return True
+                else:
+                    logger.info(f"   ℹ️  {len(repo_dates)} productos en repositorio, {len(missing_dates)} faltantes")
+                    logger.info(f"   → Procesamiento incremental necesario\n")
+            else:
+                logger.info(f"   ℹ️  Repositorio polarimetría no existe aún")
+                logger.info(f"   → Procesamiento completo necesario\n")
+        except Exception as e:
+            logger.warning(f"   ⚠️  Error accediendo a repositorio: {e}\n")
+    
+    # PASO 2: Buscar SLC preprocesados en data/preprocessed_slc/ (caché global)
+    input_dir = None
+    products = []
+    
+    if repository and track_number:
+        logger.info(f"🔍 PASO 2: Buscando SLC preprocesados en caché global...")
+        
+        try:
+            orbit_suffix = "desc" if orbit_direction == "DESCENDING" else "asce"
+            subswath_lower = subswath.lower()
+            cache_dir = Path.cwd() / "data" / "preprocessed_slc" / f"{orbit_suffix}_{subswath_lower}" / f"t{track_number:03d}"
+            
+            if cache_dir.exists():
+                # Buscar todos los productos .dim en subdirectorios de fecha
+                cached_products = []
+                for date_dir in cache_dir.iterdir():
+                    if date_dir.is_dir():
+                        cached_products.extend(date_dir.glob("*.dim"))
+                
+                if cached_products:
+                    logger.info(f"   ✓ Encontrados {len(cached_products)} SLC preprocesados en caché global")
+                    logger.info(f"   → Creando symlinks para polarimetría...\n")
+                    
+                    # Crear symlinks en workspace['preprocessed']
+                    workspace['preprocessed'].mkdir(parents=True, exist_ok=True)
+                    
+                    for cached_slc in cached_products:
+                        local_slc = workspace['preprocessed'] / cached_slc.name
+                        if not local_slc.exists():
+                            local_slc.symlink_to(cached_slc.absolute())
+                        
+                        # Symlink .data
+                        cached_data = cached_slc.with_suffix('.data')
+                        local_data = local_slc.with_suffix('.data')
+                        if cached_data.exists() and not local_data.exists():
+                            local_data.symlink_to(cached_data.absolute())
+                    
+                    input_dir = workspace['preprocessed']
+                    products = list(input_dir.glob('*.dim'))
+                    logger.info(f"   ✓ {len(products)} symlinks de SLC preprocesados creados")
+                else:
+                    logger.info(f"   ℹ️  Caché global existe pero sin productos")
+            else:
+                logger.info(f"   ℹ️  Caché global no existe: {cache_dir}")
+        except Exception as e:
+            logger.warning(f"   ⚠️  Error accediendo a caché global: {e}")
+    
+    # PASO 3: Buscar SLC preprocesados locales
     if not products:
-        logger.warning("No hay productos preprocesados. Intentando con SLC originales...")
+        logger.info(f"\n🔍 PASO 3: Buscando SLC preprocesados locales...")
+        input_dir = workspace['preprocessed']
+        products = list(input_dir.glob('*.dim'))
+        
+        if products:
+            logger.info(f"   ✓ Encontrados {len(products)} SLC preprocesados locales")
+        else:
+            logger.info(f"   ℹ️  No hay SLC preprocesados locales")
+    
+    # PASO 4: Último recurso - usar SLC originales
+    if not products:
+        logger.warning(f"\n⚠️  PASO 4: Usando SLC originales (último recurso)")
+        logger.warning(f"   Nota: Esto requiere preprocesamiento y es menos eficiente")
         input_dir = workspace['slc']
         products = list(input_dir.glob('*.SAFE'))
+        
+        if products:
+            logger.warning(f"   → {len(products)} SLC originales serán preprocesados\n")
+        else:
+            logger.error(f"   ✗ No se encontraron SLC originales")
+            return False
 
     total = len(products)
     processed = 0
     failed = 0
     skipped_from_repo = 0
-
-    # Extraer track del primer producto si usamos repositorio
-    if repository and track_number is None and len(products) > 0:
-        track_number = repository.extract_track_from_slc(str(products[0]))
-        if track_number:
-            logger.info(f"📡 Track detectado: {track_number}\n")
-        else:
-            logger.warning("⚠️  No se pudo detectar track - deshabilitando repositorio\n")
-            repository = None
+    
+    logger.info(f"\n📋 Resumen: {total} productos a procesar para polarimetría\n")
 
     for idx, product in enumerate(products, 1):
         product_name = product.stem
@@ -1190,10 +1730,18 @@ def run_polarimetric_processing(workspace, series_config, use_repository=False, 
                 logger.debug(f"  Error consultando repositorio: {e}")
 
         logger.info(f"[{idx}/{total}] Procesando Polarimetría: {product_name}")
-        
+
         try:
+            # Detectar si el producto es preprocesado (.dim) o original (.SAFE)
+            is_preprocessed = product.suffix == '.dim'
+
+            if is_preprocessed:
+                logger.debug(f"  → Producto preprocesado (.dim) - Skip Apply-Orbit-File")
+            else:
+                logger.debug(f"  → Producto original (.SAFE) - Apply-Orbit-File incluido")
+
             # 1. Generar XML
-            xml_content = create_pol_decomposition_xml(str(product), str(output_file))
+            xml_content = create_pol_decomposition_xml(str(product), str(output_file), is_preprocessed=is_preprocessed)
             
             # 2. Guardar XML temporal
             xml_path = pol_dir / "temp_pol.xml"
@@ -1225,6 +1773,37 @@ def run_polarimetric_processing(workspace, series_config, use_repository=False, 
                                 shutil.copytree(output_data, dest_data, dirs_exist_ok=True)
 
                             logger.info(f"  📦 Guardado en repositorio: track {track_number}/polarimetry/{product_date}/")
+
+                            # OPTIMIZACIÓN: Reemplazar archivos locales por symlinks para ahorrar espacio
+                            try:
+                                # Verificar que la copia al repositorio fue exitosa
+                                dest_data = dest_file.with_suffix('.data')
+                                if dest_file.exists() and dest_data.exists():
+                                    # Calcular tamaño para logging
+                                    local_size_mb = output_file.stat().st_size / (1024 * 1024)
+
+                                    # Eliminar archivos locales
+                                    logger.debug(f"  🗑️  Eliminando producto local para ahorrar espacio...")
+                                    local_data = output_file.with_suffix('.data')
+
+                                    if output_file.exists() and not output_file.is_symlink():
+                                        output_file.unlink()
+                                        logger.debug(f"    ✓ Eliminado: {output_file.name}")
+
+                                    if local_data.exists() and not local_data.is_symlink():
+                                        shutil.rmtree(local_data)
+                                        logger.debug(f"    ✓ Eliminado: {local_data.name}/")
+
+                                    # Crear symlinks desde workspace → repositorio
+                                    output_file.symlink_to(dest_file.absolute())
+                                    local_data.symlink_to(dest_data.absolute())
+
+                                    logger.info(f"  🔗 Symlinks creados: workspace → repositorio (~{local_size_mb:.0f} MB ahorrados)")
+                                else:
+                                    logger.warning(f"  ⚠️  Copia al repositorio incompleta - manteniendo archivos locales")
+                            except Exception as e:
+                                logger.warning(f"  ⚠️  Error creando symlinks: {e}")
+                                logger.warning(f"  Producto guardado en repositorio pero duplicado en workspace")
 
                             # Actualizar metadata
                             metadata = repository.load_metadata(orbit_direction, subswath, track_number)
@@ -1263,7 +1842,7 @@ def run_polarimetric_processing(workspace, series_config, use_repository=False, 
     return True
 
 
-def get_existing_insar_pairs(repository, orbit_direction, subswath, track_number):
+def get_existing_insar_pairs(repository, orbit_direction, subswath, track_number, series_dates=None):
     """
     Obtiene lista de pares InSAR ya existentes en el repositorio.
 
@@ -1272,6 +1851,7 @@ def get_existing_insar_pairs(repository, orbit_direction, subswath, track_number
         orbit_direction: ASCENDING o DESCENDING
         subswath: IW1, IW2, o IW3
         track_number: Número de track
+        series_dates: Set opcional de fechas (YYYYMMDD) para filtrar pares de la serie
 
     Returns:
         dict: {'short': [(master, slave), ...], 'long': [(master, slave), ...]}
@@ -1293,9 +1873,14 @@ def get_existing_insar_pairs(repository, orbit_direction, subswath, track_number
         for product in metadata.get('insar_products', []):
             master = product.get('master_date')
             slave = product.get('slave_date')
-            pair_type = product.get('type', 'short')  # short o long
+            pair_type = product.get('pair_type', 'short')  # CORRECCIÓN: era 'type', debe ser 'pair_type'
 
             if master and slave:
+                # FILTRO: Solo incluir pares que estén dentro del periodo de la serie
+                if series_dates is not None:
+                    if master not in series_dates or slave not in series_dates:
+                        continue  # Saltar pares fuera del periodo
+                
                 existing_pairs[pair_type].append((master, slave))
 
     except Exception as e:
@@ -1533,6 +2118,108 @@ def download_missing_slcs(missing_dates, series_config, workspace):
     return True
 
 
+def check_final_products_complete(output_dir, series_config):
+    """
+    Verifica si ya existen TODOS los productos finales esperados (cropped)
+    
+    Esta función calcula cuántos pares InSAR deberían existir según las fechas
+    disponibles en la configuración y verifica que todos los archivos cropped
+    finales ya estén presentes.
+    
+    Args:
+        output_dir: Directorio de salida de la serie
+        series_config: Configuración de la serie con productos/fechas
+        
+    Returns:
+        tuple: (complete: bool, info: dict)
+            - complete: True si todos los productos finales existen
+            - info: Información sobre productos esperados vs existentes
+    """
+    output_path = Path(output_dir)
+    cropped_dir = output_path / "insar" / "cropped"
+    
+    # Verificar que existe el directorio cropped
+    if not cropped_dir.exists():
+        return False, {
+            'expected': 0,
+            'existing': 0,
+            'message': 'Directorio cropped no existe'
+        }
+    
+    # Extraer fechas únicas de los productos en la configuración
+    import re
+    dates = set()
+    for product in series_config.get('products', []):
+        product_name = product.get('product', '')
+        # Formato: S1A_IW_SLC__1SDV_20230111T060136_...
+        match = re.search(r'_(\d{8})T\d{6}', product_name)
+        if match:
+            dates.add(match.group(1))
+    
+    dates = sorted(list(dates))
+    
+    if len(dates) < 2:
+        return False, {
+            'expected': 0,
+            'existing': 0,
+            'message': 'Menos de 2 fechas en configuración'
+        }
+    
+    # Calcular pares esperados (consecutivos short + long)
+    expected_pairs = []
+    
+    # Pares short (consecutivos)
+    for i in range(len(dates) - 1):
+        master = dates[i]
+        slave = dates[i + 1]
+        expected_pairs.append(f"Ifg_{master}_{slave}_cropped.tif")
+    
+    # Pares long (saltar 1, cada 3 fechas)
+    for i in range(len(dates) - 2):
+        master = dates[i]
+        slave = dates[i + 2]
+        expected_pairs.append(f"Ifg_{master}_{slave}_LONG_cropped.tif")
+    
+    # Verificar qué pares existen
+    existing_files = set()
+    for tif_file in cropped_dir.glob("Ifg_*_cropped.tif"):
+        existing_files.add(tif_file.name)
+    
+    # Verificar completitud
+    missing_pairs = []
+    for expected in expected_pairs:
+        if expected not in existing_files:
+            missing_pairs.append(expected)
+    
+    complete = len(missing_pairs) == 0
+    
+    # Extraer fechas necesarias de los pares faltantes
+    required_dates = set()
+    if missing_pairs:
+        import re
+        for missing_pair in missing_pairs:
+            # Formato: Ifg_20240704_20240716_cropped.tif o Ifg_20240704_20240716_LONG_cropped.tif
+            match = re.search(r'Ifg_(\d{8})_(\d{8})', missing_pair)
+            if match:
+                master_date, slave_date = match.groups()
+                required_dates.add(master_date)
+                required_dates.add(slave_date)
+    
+    info = {
+        'expected': len(expected_pairs),
+        'existing': len(existing_files),
+        'missing': len(missing_pairs),
+        'dates': dates,
+        'required_dates': sorted(list(required_dates)),  # Fechas SLC necesarias para pares faltantes
+        'message': f'{len(existing_files)}/{len(expected_pairs)} productos finales'
+    }
+    
+    if missing_pairs and len(missing_pairs) <= 10:
+        info['missing_list'] = missing_pairs
+    
+    return complete, info
+
+
 def check_and_use_repository_products(series_config, workspace, use_repository=False):
     """
     Verifica si los productos finales ya existen en el repositorio para este track.
@@ -1604,8 +2291,11 @@ def check_and_use_repository_products(series_config, workspace, use_repository=F
     if slc_dates:
         logger.info(f"  Rango: {slc_dates[0]} → {slc_dates[-1]}")
 
-    # Obtener pares existentes en repositorio
-    existing_pairs = get_existing_insar_pairs(repository, orbit_direction, subswath, track_number)
+    # Obtener pares existentes en repositorio (FILTRADOS por fechas de la serie)
+    existing_pairs = get_existing_insar_pairs(
+        repository, orbit_direction, subswath, track_number, 
+        series_dates=set(slc_dates)  # Filtrar solo pares dentro del periodo de la serie
+    )
     existing_count = len(existing_pairs['short']) + len(existing_pairs['long'])
 
     logger.info(f"\nPares existentes en repositorio:")
@@ -1694,6 +2384,194 @@ def check_and_use_repository_products(series_config, workspace, use_repository=F
         }
 
 
+def run_preprocessing_incremental(workspace, config_file, required_slc_dates):
+    """
+    Ejecuta preprocesamiento SOLO de los SLCs necesarios para procesamiento incremental.
+
+    Args:
+        workspace: Dict con rutas del workspace
+        config_file: Ruta al config.txt
+        required_slc_dates: Set de fechas SLC necesarias (formato YYYYMMDD)
+
+    Returns:
+        bool: True si tuvo éxito
+    """
+    logger.info(f"Preprocesando solo SLCs necesarios para pares faltantes...")
+
+    # Verificar si existe caché compartido
+    from pathlib import Path
+    import shutil
+
+    project_base = workspace['base'].parent
+    orbit_direction = None
+    subswath = None
+
+    # Leer orbit y subswath del config
+    if config_file.exists():
+        with open(config_file, 'r') as f:
+            for line in f:
+                if line.startswith('ORBIT_DIRECTION='):
+                    orbit_direction = line.split('=')[1].strip().strip('"')
+                elif line.startswith('SUBSWATH='):
+                    subswath = line.split('=')[1].strip().strip('"').lower()
+
+    if not orbit_direction or not subswath:
+        logger.warning("No se pudo leer orbit/subswath del config")
+        return False
+
+    orbit_suffix = "desc" if orbit_direction == "DESCENDING" else "asce"
+    shared_slc_dir = project_base / f"slc_preprocessed_{orbit_suffix}" / "products" / subswath
+
+    # Verificar qué SLCs ya están preprocesados en caché compartido
+    preprocessed_dates = set()
+    if shared_slc_dir.exists():
+        for dim_file in shared_slc_dir.glob("*.dim"):
+            # Extraer fecha del nombre
+            import re
+            match = re.search(r'(\d{8})', dim_file.stem)
+            if match:
+                preprocessed_dates.add(match.group(1))
+
+    # Identificar SLCs que necesitan preprocesamiento
+    slcs_to_preprocess = required_slc_dates - preprocessed_dates
+
+    if not slcs_to_preprocess:
+        logger.info(f"✓ Todos los SLCs necesarios ya están preprocesados en caché")
+        # Crear symlink al caché compartido
+        series_slc_link = workspace['preprocessed']
+        if series_slc_link.exists() and not series_slc_link.is_symlink():
+            shutil.rmtree(series_slc_link)
+        if not series_slc_link.exists():
+            relative_path = os.path.relpath(shared_slc_dir, series_slc_link.parent)
+            series_slc_link.symlink_to(relative_path)
+            logger.info(f"  ✓ Symlink a caché: {series_slc_link.name} -> {relative_path}")
+        return True
+
+    logger.info(f"  SLCs en caché: {len(preprocessed_dates)}")
+    logger.info(f"  SLCs a preprocesar: {len(slcs_to_preprocess)}")
+
+    # Filtrar productos SLC del workspace que necesitan preprocesamiento
+    slc_products_to_process = []
+    for slc_path in workspace['slc'].glob('*.SAFE'):
+        from processing_utils import extract_date_from_filename
+        date_str = extract_date_from_filename(slc_path.name)
+        if date_str and date_str[:8] in slcs_to_preprocess:
+            slc_products_to_process.append(slc_path)
+
+    if not slc_products_to_process:
+        logger.warning("No se encontraron SLCs para preprocesar en workspace")
+        return False
+
+    logger.info(f"  Productos SLC a preprocesar: {len(slc_products_to_process)}")
+
+    # Crear archivo temporal de configuración solo con los SLCs necesarios
+    import tempfile
+    temp_slc_dir = Path(tempfile.mkdtemp(prefix="slc_incremental_"))
+
+    try:
+        # Crear symlinks solo a SLCs necesarios
+        for slc_path in slc_products_to_process:
+            link_path = temp_slc_dir / slc_path.name
+            if not link_path.exists():
+                link_path.symlink_to(slc_path.absolute())
+
+        # Crear config temporal apuntando al directorio filtrado
+        temp_config = workspace['base'] / 'config_incremental.txt'
+        with open(config_file, 'r') as f_in:
+            with open(temp_config, 'w') as f_out:
+                for line in f_in:
+                    if line.startswith('SLC_DIR='):
+                        f_out.write(f'SLC_DIR="{temp_slc_dir}"\n')
+                    else:
+                        f_out.write(line)
+
+        # Ejecutar preprocesamiento con config temporal
+        project_root = Path.cwd()
+        cmd = [
+            sys.executable,
+            str(project_root / "scripts" / "preprocess_products.py"),
+            "--slc",
+            "--insar-mode",
+            "--config", str(temp_config.name)
+        ]
+
+        logger.info(f"Ejecutando: {' '.join(cmd[:4])}...\n")
+
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            cwd=str(workspace['base'])
+        )
+
+        # Mostrar salida
+        if result.stdout:
+            lines = result.stdout.strip().split('\n')
+            for line in lines[-20:]:
+                logger.info(line)
+
+        if result.returncode == 0:
+            preprocessed_count = len(list(workspace['preprocessed'].glob('*.dim')))
+            logger.info(f"\n✓ Preprocesamiento incremental completado")
+            logger.info(f"  Productos preprocesados: {preprocessed_count}")
+            return True
+        else:
+            logger.error(f"\n✗ Error en preprocesamiento incremental")
+            return False
+
+    finally:
+        # Limpiar directorio temporal
+        if temp_slc_dir.exists():
+            shutil.rmtree(temp_slc_dir)
+        if temp_config.exists():
+            temp_config.unlink()
+
+
+def run_insar_processing_incremental(workspace, config_file, series_config,
+                                      missing_pairs, use_preprocessed=False,
+                                      use_repository=False, save_to_repository=False):
+    """
+    Ejecuta procesamiento InSAR SOLO de los pares faltantes.
+
+    Args:
+        workspace: Dict con rutas del workspace
+        config_file: Ruta al config.txt
+        series_config: Configuración de la serie
+        missing_pairs: Dict con pares faltantes {'short': [(m,s), ...], 'long': [(m,s), ...]}
+        use_preprocessed: Si usar productos preprocesados
+        use_repository: Buscar productos en repositorio
+        save_to_repository: Guardar al repositorio
+
+    Returns:
+        bool: True si tuvo éxito
+    """
+    logger.info(f"Procesando solo pares faltantes...")
+
+    orbit = series_config['orbit_direction']
+    subswath = series_config['subswath']
+
+    logger.info(f"  Serie: {orbit}-{subswath}")
+    logger.info(f"  Pares short a procesar: {len(missing_pairs['short'])}")
+    logger.info(f"  Pares long a procesar: {len(missing_pairs['long'])}")
+    logger.info("")
+
+    # Por ahora, delegamos al script normal de InSAR
+    # El filtrado de pares se hace verificando si ya existen en workspace
+    # (ya creamos symlinks a existentes, entonces process_insar_gpt los saltará)
+
+    success = run_insar_processing(
+        workspace,
+        config_file,
+        series_config,
+        use_preprocessed=use_preprocessed,
+        use_repository=use_repository,
+        save_to_repository=save_to_repository
+    )
+
+    return success
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Procesa una serie InSAR específica desde configuración JSON',
@@ -1751,6 +2629,44 @@ def main():
     logger.info(f"{'='*80}")
     logger.info(f"Configuración: {args.config}")
     logger.info(f"Directorio salida: {output_dir}")
+    logger.info("")
+
+    # VERIFICACIÓN TEMPRANA: ¿Ya están todos los productos finales?
+    complete, info = check_final_products_complete(output_dir, series_config)
+    
+    # Guardar info para uso posterior (preprocesamiento selectivo)
+    global final_products_info
+    final_products_info = info
+    
+    if complete:
+        logger.info(f"{'='*80}")
+        logger.info(f"✓ SERIE YA COMPLETAMENTE PROCESADA")
+        logger.info(f"{'='*80}")
+        logger.info(f"Productos finales: {info['existing']}/{info['expected']} (100%)")
+        logger.info(f"Fechas: {len(info['dates'])} ({info['dates'][0]} → {info['dates'][-1]})")
+        logger.info(f"Directorio: {output_dir}/fusion/insar/cropped/")
+        logger.info(f"")
+        logger.info(f"→ SALTANDO TODO EL PROCESAMIENTO (ya completo)")
+        logger.info(f"{'='*80}")
+        return 0
+    elif info['existing'] > 0:
+        logger.info(f"{'='*80}")
+        logger.info(f"⚠️  PROCESAMIENTO PARCIALMENTE COMPLETO")
+        logger.info(f"{'='*80}")
+        logger.info(f"Productos existentes: {info['existing']}/{info['expected']}")
+        logger.info(f"Productos faltantes: {info['missing']}")
+        if 'missing_list' in info:
+            logger.info(f"Pares faltantes:")
+            for missing in info['missing_list']:
+                logger.info(f"  - {missing}")
+        logger.info(f"")
+        logger.info(f"Fechas SLC necesarias para completar: {len(info['required_dates'])}")
+        if len(info['required_dates']) <= 10:
+            logger.info(f"  {', '.join(info['required_dates'])}")
+        logger.info(f"")
+        logger.info(f"→ Solo se preprocesarán los {len(info['required_dates'])} SLCs necesarios")
+        logger.info(f"{'='*80}")
+        logger.info(f"")
 
     # Crear workspace (ahora logger ya existe)
     workspace = create_series_workspace(series_config, output_dir)
@@ -1769,7 +2685,35 @@ def main():
     # Crear archivo de configuración
     config_file = create_config_file(series_config, workspace)
 
-    # PASO 0: VERIFICAR REPOSITORIO PRIMERO (ahorra 2-3 horas si productos ya existen)
+    # PASO 0: VALIDACIÓN TEMPRANA DE COBERTURA (antes de todo procesamiento)
+    # Validar que el subswath cubre el AOI ANTES de verificar repositorio o procesar
+    logger.info(f"\n{'=' * 80}")
+    logger.info(f"VALIDACIÓN PREVIA DE COBERTURA")
+    logger.info(f"{'=' * 80}\n")
+
+    is_valid, coverage_pct, message = validate_subswath_coverage_before_processing(series_config, workspace)
+    logger.info(f"  {message}")
+
+    if not is_valid:
+        logger.error(f"\n{'=' * 80}")
+        logger.error(f"✗ VALIDACIÓN FALLIDA: Subswath sin cobertura suficiente del AOI")
+        logger.error(f"{'=' * 80}")
+        logger.error(f"  Cobertura detectada: {coverage_pct:.1f}%")
+        logger.error(f"  Se requiere mínimo 10% de cobertura para procesar")
+        logger.error(f"\nACCIÓN RECOMENDADA:")
+        logger.error(f"  - Verificar que el AOI esté dentro del área de cobertura del subswath")
+        logger.error(f"  - Considerar usar otro subswath (IW1 o IW2)")
+        logger.error(f"  - Revisar la configuración JSON de la serie")
+        logger.error(f"\n  → NO SE REALIZARÁ PROCESAMIENTO")
+        logger.error(f"{'=' * 80}\n")
+        return 2  # Exit code 2 = validación previa fallida
+
+    if coverage_pct > 0 and coverage_pct < 50:
+        logger.warning(f"\n⚠️  ADVERTENCIA: Cobertura parcial ({coverage_pct:.1f}%)")
+        logger.warning(f"  Se recomienda verificar si otro subswath tiene mejor cobertura")
+        logger.warning(f"  Continuando con el procesamiento...\n")
+
+    # PASO 1: VERIFICAR REPOSITORIO PRIMERO (ahorra 2-3 horas si productos ya existen)
     repo_check_result = check_and_use_repository_products(
         series_config,
         workspace,
@@ -1782,26 +2726,70 @@ def main():
         using_repo_products = True
     elif isinstance(repo_check_result, dict):
         # CASO 2: Procesamiento incremental - hay pares faltantes
-        logger.warning(f"\n{'=' * 80}")
-        logger.warning(f"⚠️  PROCESAMIENTO INCREMENTAL DETECTADO")
-        logger.warning(f"{'=' * 80}")
-        logger.warning(f"Pares faltantes: {repo_check_result['missing_count']}")
-        logger.warning(f"Pares existentes: {repo_check_result['existing_count']}")
-        logger.warning("")
+        logger.info(f"\n{'=' * 80}")
+        logger.info(f"⚙️  PROCESAMIENTO INCREMENTAL ACTIVADO")
+        logger.info(f"{'=' * 80}")
+        logger.info(f"Pares faltantes a procesar: {repo_check_result['missing_count']}")
+        logger.info(f"Pares existentes (reutilizar): {repo_check_result['existing_count']}")
+        logger.info("")
 
-        # NUEVO: Verificar si faltan SLCs para los pares faltantes
+        # 1. Crear symlinks a pares existentes
+        logger.info("PASO 1: Creando symlinks a pares existentes en repositorio...")
+        repository = repo_check_result['repository']
+        orbit_direction = repo_check_result['orbit_direction']
+        subswath = repo_check_result['subswath']
+        track_number = repo_check_result['track_number']
+        existing_pairs = repo_check_result['existing_pairs']
+
+        track_dir = repository.get_track_dir(orbit_direction, subswath, track_number)
+
+        # Crear symlinks para pares short existentes
+        for master_date, slave_date in existing_pairs['short']:
+            pair_name = f"Ifg_{master_date}_{slave_date}.dim"
+            repo_file = track_dir / "insar" / "short" / pair_name
+            local_file = workspace['insar_short'] / pair_name
+
+            if repo_file.exists() and not local_file.exists():
+                local_file.symlink_to(repo_file.absolute())
+                # Symlink .data
+                repo_data = repo_file.with_suffix('.data')
+                local_data = local_file.with_suffix('.data')
+                if repo_data.exists() and not local_data.exists():
+                    local_data.symlink_to(repo_data.absolute())
+
+        # Crear symlinks para pares long existentes
+        for master_date, slave_date in existing_pairs['long']:
+            pair_name = f"Ifg_{master_date}_{slave_date}_LONG.dim"
+            repo_file = track_dir / "insar" / "long" / pair_name
+            local_file = workspace['insar_long'] / pair_name
+
+            if repo_file.exists() and not local_file.exists():
+                local_file.symlink_to(repo_file.absolute())
+                # Symlink .data
+                repo_data = repo_file.with_suffix('.data')
+                local_data = local_file.with_suffix('.data')
+                if repo_data.exists() and not local_data.exists():
+                    local_data.symlink_to(repo_data.absolute())
+
+        logger.info(f"✓ Symlinks creados: {repo_check_result['existing_count']} pares")
+
+        # 2. Identificar SLCs necesarios para pares faltantes
         missing_pairs = repo_check_result.get('missing_pairs', {'short': [], 'long': []})
         required_slc_dates = get_required_slc_dates(missing_pairs)
+
+        logger.info(f"\nPASO 2: Verificando SLCs necesarios para {repo_check_result['missing_count']} pares faltantes...")
+        logger.info(f"  SLCs únicos necesarios: {len(required_slc_dates)}")
+
         missing_slc_dates = check_missing_slcs(required_slc_dates, workspace['slc'])
 
         if missing_slc_dates:
-            logger.warning(f"⚠️  Detectados {len(missing_slc_dates)} SLCs faltantes necesarios para pares:")
+            logger.warning(f"⚠️  Detectados {len(missing_slc_dates)} SLCs faltantes necesarios:")
             for date in missing_slc_dates:
                 logger.warning(f"   - {date}")
             logger.warning("")
 
             # Intentar descargar SLCs faltantes
-            logger.warning(f"Intentando descargar SLCs faltantes desde Copernicus...")
+            logger.info(f"Descargando SLCs faltantes desde Copernicus...")
             download_success = download_missing_slcs(missing_slc_dates, series_config, workspace)
 
             if not download_success:
@@ -1810,21 +2798,30 @@ def main():
                 logger.error(f"  Verifica la conectividad y disponibilidad de productos en Copernicus")
                 return 1
 
-            logger.info(f"✓ SLCs faltantes descargados correctamente\n")
+            logger.info(f"✓ SLCs faltantes descargados\n")
         else:
-            logger.info(f"✓ Todos los SLCs necesarios ya están disponibles localmente\n")
+            logger.info(f"✓ Todos los SLCs necesarios están disponibles\n")
 
-        logger.warning(f"Se procesará TODO desde cero y se actualizará el repositorio.")
-        logger.warning(f"Los pares existentes se mantendrán, los nuevos se añadirán.")
-        logger.warning(f"{'=' * 80}\n")
+        # 3. Configurar para procesamiento incremental
+        logger.info(f"PASO 3: Procesamiento incremental configurado")
+        logger.info(f"  → Solo preprocesar {len(required_slc_dates)} SLCs necesarios")
+        logger.info(f"  → Solo procesar {repo_check_result['missing_count']} pares nuevos")
+        logger.info(f"  → Reutilizar {repo_check_result['existing_count']} pares existentes")
+        logger.info(f"{'=' * 80}\n")
 
-        # Por ahora, procesar TODO (futuro: solo faltantes)
-        using_repo_products = False
+        # Marcar para procesamiento incremental (no usar todos los productos del repo)
+        using_repo_products = 'incremental'
+        incremental_info = {
+            'required_slc_dates': required_slc_dates,
+            'missing_pairs': missing_pairs,
+            'repository': repository,
+            'track_number': track_number
+        }
     else:
         # CASO 3: Repositorio vacío o error
         using_repo_products = False
 
-    if using_repo_products:
+    if using_repo_products is True:
         logger.info(f"\n{'=' * 80}")
         logger.info(f"✓ PRODUCTOS OBTENIDOS DESDE REPOSITORIO")
         logger.info(f"{'=' * 80}")
@@ -1832,8 +2829,8 @@ def main():
         logger.info(f"  - Validación de cobertura (ya verificada previamente)")
         logger.info(f"  - Pre-procesamiento SLC")
         logger.info(f"  - Procesamiento InSAR")
-        logger.info(f"  - Procesamiento polarimétrico")
         logger.info(f"Continuando con:")
+        logger.info(f"  - Búsqueda de productos polarimétricos en repositorio")
         logger.info(f"  - Recorte a AOI")
         logger.info(f"  - Cálculo de estadísticas")
         logger.info(f"{'=' * 80}\n")
@@ -1843,32 +2840,63 @@ def main():
         insar_success = True
         preprocessing_success = True
 
-    else:
-        # PASO 0: Validación previa de cobertura (ANTES de procesar)
-        # OPTIMIZACIÓN: Evita procesar si el subswath no cubre el AOI
+    elif using_repo_products == 'incremental':
+        # PROCESAMIENTO INCREMENTAL: procesar solo lo necesario
+        # NOTA: Validación de cobertura ya realizada al inicio
+
+        # PASO 1: Verificar órbitas
+        if not check_and_setup_orbits(workspace):
+            logger.warning(f"⚠️  Advertencia en órbitas, pero continuando...")
+
+        # PASO 2: Pre-procesamiento SOLO de SLCs necesarios
         logger.info(f"\n{'=' * 80}")
-        logger.info(f"PASO 0: VALIDACIÓN PREVIA DE COBERTURA")
+        logger.info(f"PASO 2: PRE-PROCESAMIENTO INCREMENTAL")
         logger.info(f"{'=' * 80}\n")
+        logger.info(f"Solo preprocesar {len(incremental_info['required_slc_dates'])} SLCs necesarios")
+        logger.info(f"(de {len(list(workspace['slc'].glob('*.SAFE')))} SLCs totales en workspace)\n")
 
-        is_valid, coverage_pct, message = validate_subswath_coverage_before_processing(series_config, workspace)
-        logger.info(f"  {message}")
+        # Filtrar solo SLCs necesarios para preprocesamiento (usando función modificada)
+        preprocessing_success = run_preprocessing(
+            workspace,
+            config_file,
+            required_slc_dates=incremental_info['required_slc_dates']
+        )
 
-        if not is_valid:
-            logger.error(f"\n{'=' * 80}")
-            logger.error(f"✗ VALIDACIÓN FALLIDA: Subswath sin cobertura suficiente del AOI")
-            logger.error(f"{'=' * 80}")
-            logger.error(f"  Cobertura detectada: {coverage_pct:.1f}%")
-            logger.error(f"  Se requiere mínimo 10% de cobertura para procesar")
-            logger.error(f"\nACCIÓN RECOMENDADA:")
-            logger.error(f"  - Verificar que el AOI esté dentro del área de cobertura del subswath")
-            logger.error(f"  - Considerar usar otro subswath (IW1 o IW2)")
-            logger.error(f"  - Revisar la configuración JSON de la serie")
-            return 2  # Exit code 2 = validación previa fallida
+        # PASO 3: Procesamiento InSAR SOLO de pares faltantes (usando función modificada)
+        logger.info(f"\n{'=' * 80}")
+        logger.info(f"PASO 3: PROCESAMIENTO INSAR INCREMENTAL")
+        logger.info(f"{'=' * 80}\n")
+        logger.info(f"Solo procesar {len(incremental_info['missing_pairs']['short'])} pares short")
+        logger.info(f"Solo procesar {len(incremental_info['missing_pairs']['long'])} pares long\n")
 
-        if coverage_pct > 0 and coverage_pct < 50:
-            logger.warning(f"\n⚠️  ADVERTENCIA: Cobertura parcial ({coverage_pct:.1f}%)")
-            logger.warning(f"  Se recomienda verificar si otro subswath tiene mejor cobertura")
-            logger.warning(f"  Continuando con el procesamiento...")
+        # Convertir incremental_info al formato esperado por run_insar_processing
+        missing_info_for_insar = {
+            'all_exist': False,  # Si estamos aquí, hay pares faltantes
+            'missing_count': len(incremental_info['missing_pairs']['short']) + len(incremental_info['missing_pairs']['long']),
+            'existing_count': repo_check_result['existing_count'],
+            'missing_pairs': [(m, s, 'short') for m, s in incremental_info['missing_pairs']['short']] +
+                           [(m, s, 'long') for m, s in incremental_info['missing_pairs']['long']],
+            'required_slc_dates': incremental_info['required_slc_dates']
+        }
+
+        insar_success = run_insar_processing(
+            workspace,
+            config_file,
+            series_config,
+            use_preprocessed=preprocessing_success,
+            use_repository=args.use_repository,
+            save_to_repository=args.save_to_repository,
+            missing_info=missing_info_for_insar
+        )
+
+        if not insar_success:
+            logger.error(f"✗ Error en procesamiento InSAR incremental - abortando")
+            print_summary(series_config, workspace, False, args.full_pipeline)
+            return 1
+
+    else:
+        # MODO NORMAL (sin repositorio)
+        # NOTA: Validación de cobertura ya realizada al inicio
 
         # PASO 1: Verificar y preparar órbitas
         if not check_and_setup_orbits(workspace):
@@ -1910,7 +2938,23 @@ def main():
         else:
             logger.warning(f"\n⚠️  No se encontró SLC compartido, pre-procesando para esta serie")
             # Cada serie preprocesa sus propios SLC en su workspace local
-            preprocessing_success = run_preprocessing(workspace, config_file)
+            
+            # OPTIMIZACIÓN: Si ya hay productos parcialmente completos, usar preprocesamiento selectivo
+            # Esto evita iterar sobre todos los SLCs cuando solo faltan algunos pares
+            if 'final_products_info' in globals() and final_products_info.get('required_dates'):
+                logger.info(f"\n🎯 PREPROCESAMIENTO SELECTIVO ACTIVADO")
+                logger.info(f"  Solo se preprocesarán {len(final_products_info['required_dates'])} SLCs necesarios")
+                logger.info(f"  (en lugar de verificar {len(list(workspace['slc'].glob('*.SAFE')))} SLCs totales)")
+                logger.info("")
+                
+                preprocessing_success = run_preprocessing_incremental(
+                    workspace,
+                    config_file,
+                    set(final_products_info['required_dates'])
+                )
+            else:
+                # Preprocesamiento normal (todos los SLCs)
+                preprocessing_success = run_preprocessing(workspace, config_file)
 
         # PASO 3: Procesamiento InSAR
         insar_success = run_insar_processing(
@@ -1958,22 +3002,23 @@ def main():
         # La coherencia está disponible directamente en los productos InSAR
         # stats_success = run_statistics(workspace, series_config)
 
-        # PASO 6: Validar cobertura real del subswath
+        # PASO 6: Validar cobertura real del subswath (verificación posterior)
+        # NOTA: Esta es una verificación adicional post-procesamiento
+        # La validación previa (PASO 0) ya debería haber detectado problemas de cobertura
         is_valid, valid_pairs, total_pairs, avg_coverage = validate_subswath_coverage(workspace)
         
         if not is_valid:
             logger.warning(f"\n{'=' * 80}")
-            logger.warning(f"SUBSWATH SIN COBERTURA DEL AOI")
+            logger.warning(f"⚠️  ADVERTENCIA: VALIDACIÓN POSTERIOR DETECTÓ PROBLEMAS DE COBERTURA")
             logger.warning(f"{'=' * 80}")
+            logger.warning(f"  Cobertura promedio en productos InSAR: {avg_coverage:.2f}%")
+            logger.warning(f"  Pares válidos: {valid_pairs}/{total_pairs}")
+            logger.warning(f"\n  Nota: La validación previa indicó cobertura suficiente,")
+            logger.warning(f"        pero los productos generados tienen baja cobertura real.")
+            logger.warning(f"        Esto puede indicar problemas en el procesamiento o bursts sin datos.")
+            logger.warning(f"{'=' * 80}\n")
             
-            # Eliminar subswath inválido
-            cleanup_invalid_subswath(workspace, series_config)
-            
-            logger.error(f"\nEl procesamiento se detuvo porque el subswath no cubre el AOI")
-            logger.error(f"Cobertura promedio: {avg_coverage:.2f}%")
-            logger.error(f"Pares válidos: {valid_pairs}/{total_pairs}")
-            
-            return 2  # Exit code 2 = subswath sin cobertura
+            # No eliminar - solo advertir. Los productos pueden ser útiles para análisis.
 
         # PASO 6: Limpieza de archivos intermedios
         logger.info(f"\n{'=' * 80}")
