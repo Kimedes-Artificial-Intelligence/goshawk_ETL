@@ -559,7 +559,7 @@ def process_pair_with_gpt(
                 ['gpt', xml_file, '-c', '8G'],
                 capture_output=True,
                 text=True,
-                timeout=3600  # 60 min timeout (InSAR es más lento)
+                timeout=7200  # 120 min timeout (InSAR es más lento)
             )
 
             # Validar el resultado
@@ -622,6 +622,16 @@ def generate_insar_pairs(
     Los pares largos son necesarios para cerrar el bucle interferométrico
     y calcular la Closure Phase, crucial para validar la calidad InSAR.
 
+    IMPORTANTE: Valida que los pares sean temporalmente consecutivos.
+    Si hay un salto temporal grande (>12 días para short, >24 días para long),
+    el par se descarta automáticamente con una advertencia.
+
+    Límites basados en ciclo de repetición de Sentinel-1:
+    - 1 satélite (2023-2024): 12 días
+    - 2 satélites (2014-2022): 6 días
+    - Pares cortos: máximo 12 días (1 ciclo)
+    - Pares largos: máximo 24 días (2 ciclos)
+
     Args:
         slc_products: Lista ordenada de productos SLC
         include_long_pairs: Si True, incluye pares con salto +2
@@ -630,25 +640,67 @@ def generate_insar_pairs(
         Lista de tuplas: [(master, slave, pair_type), ...]
         pair_type: 'short' (salto +1) o 'long' (salto +2)
     """
+    from datetime import datetime
+
     pairs = []
-    
+
     # Pares consecutivos (salto +1) - Short pairs
     for i in range(len(slc_products) - 1):
-        pairs.append((
-            slc_products[i],
-            slc_products[i + 1],
-            'short'
-        ))
-    
+        master = slc_products[i]
+        slave = slc_products[i + 1]
+
+        # Validar que el salto temporal sea razonable (<= 60 días)
+        master_date_str = extract_date_from_filename(os.path.basename(master))
+        slave_date_str = extract_date_from_filename(os.path.basename(slave))
+
+        if master_date_str and slave_date_str:
+            # Parsear fechas (formato: YYYYMMDDTHHMMSS)
+            master_date = datetime.strptime(master_date_str[:8], '%Y%m%d')
+            slave_date = datetime.strptime(slave_date_str[:8], '%Y%m%d')
+
+            # Calcular diferencia en días
+            days_diff = abs((slave_date - master_date).days)
+
+            # Para pares cortos, aceptar máximo 12 días (1 ciclo de Sentinel-1)
+            # Sentinel-1A/B tienen ciclo de repetición de 12 días por satélite
+            # Con 2 satélites (2014-2022): revisita cada 6 días
+            # Con 1 satélite (2023-2024): revisita cada 12 días
+            if days_diff > 12:
+                logger.warning(f"⚠️  PAR CORTO RECHAZADO (salto temporal {days_diff} días > 12):")
+                logger.warning(f"    Master: {master_date_str[:8]} - {os.path.basename(master)[:60]}")
+                logger.warning(f"    Slave:  {slave_date_str[:8]} - {os.path.basename(slave)[:60]}")
+                logger.warning(f"    Probablemente faltan productos SLC intermedios")
+                continue
+
+        pairs.append((master, slave, 'short'))
+
     # Pares largos (salto +2) - Long pairs para Closure Phase
     if include_long_pairs and len(slc_products) >= 3:
         for i in range(len(slc_products) - 2):
-            pairs.append((
-                slc_products[i],
-                slc_products[i + 2],
-                'long'
-            ))
-    
+            master = slc_products[i]
+            slave = slc_products[i + 2]
+
+            # Validar que el salto temporal sea razonable (<= 120 días para pares largos)
+            master_date_str = extract_date_from_filename(os.path.basename(master))
+            slave_date_str = extract_date_from_filename(os.path.basename(slave))
+
+            if master_date_str and slave_date_str:
+                master_date = datetime.strptime(master_date_str[:8], '%Y%m%d')
+                slave_date = datetime.strptime(slave_date_str[:8], '%Y%m%d')
+                days_diff = abs((slave_date - master_date).days)
+
+                # Para pares largos (salto +2), aceptar máximo 24 días (2 ciclos)
+                # Con 1 satélite: 12 + 12 = 24 días
+                # Con 2 satélites: 6 + 6 = 12 días (pero permitimos hasta 24 por seguridad)
+                if days_diff > 24:
+                    logger.warning(f"⚠️  PAR LARGO RECHAZADO (salto temporal {days_diff} días > 24):")
+                    logger.warning(f"    Master: {master_date_str[:8]} - {os.path.basename(master)[:60]}")
+                    logger.warning(f"    Slave:  {slave_date_str[:8]} - {os.path.basename(slave)[:60]}")
+                    logger.warning(f"    Probablemente faltan productos SLC intermedios")
+                    continue
+
+            pairs.append((master, slave, 'long'))
+
     return pairs
 
 
