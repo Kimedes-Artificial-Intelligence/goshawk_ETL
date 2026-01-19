@@ -640,11 +640,11 @@ def subset_product(product_path, aoi_wkt, output_dir, insar_mode=False, subswath
         polarizations = detect_available_polarizations(product_path)
 
         # Nombre de salida
-        # Usar el basename (sin extensión) para evitar colisiones cuando hay varios
-        # productos del mismo día (por ejemplo, varios SLC del mismo date).
+        # Mantener nombre original del producto + sufijo (sin prefijo adicional)
+        # Formato correcto: S1A_IW_SLC__1SDV_20230106T055327_20230106T055355_046659_0597A7_B2DA_split.dim
         base_noext = os.path.splitext(basename)[0]
         suffix = '_split' if insar_mode else '_subset'
-        output_name = f"{product_type}_{date_str[:8]}_{base_noext}{suffix}"
+        output_name = f"{base_noext}{suffix}"
         output_path = os.path.join(output_dir, output_name + '.dim')
 
         # Verificar si ya existe

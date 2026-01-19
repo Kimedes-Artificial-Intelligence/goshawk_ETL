@@ -845,6 +845,97 @@ def create_pol_decomposition_xml(
     return xml
 
 
+def extract_track_number_robust(slc_source, repository):
+    """
+    Extrae track number de forma robusta soportando:
+    - Productos .SAFE originales
+    - Productos preprocessados .dim (formato: S1A_IW_SLC__..._split.dim)
+    - Productos preprocessados con prefijo incorrecto (formato: SLC_YYYYMMDD_S1A_..._split.dim)
+    - Symlinks a .SAFE en workspace
+    
+    Args:
+        slc_source: Puede ser archivo .SAFE, .dim, o directorio (string o Path)
+        repository: InSARRepository instance
+        
+    Returns:
+        int: Track number (1-175) o None si falla
+    """
+    import re
+    from pathlib import Path
+    
+    slc_path = Path(slc_source) if not isinstance(slc_source, Path) else slc_source
+    
+    # 1. Si es .SAFE, usar método existente del repositorio
+    if str(slc_path).endswith('.SAFE'):
+        return repository.extract_track_from_slc(str(slc_path))
+    
+    # 2. Si es directorio con .SAFE symlinks, buscar primero
+    if slc_path.is_dir():
+        safe_products = list(slc_path.glob("*.SAFE"))
+        if safe_products:
+            return repository.extract_track_from_slc(str(safe_products[0]))
+        
+        # Buscar .dim files también
+        dim_files = list(slc_path.glob("*.dim"))
+        if dim_files:
+            slc_path = dim_files[0]
+    
+    # 3. Si es .dim preprocessado, parsear nombre
+    if str(slc_path).endswith('.dim'):
+        basename = slc_path.name
+        
+        # Patrón para productos Sentinel-1 (con o sin prefijo SLC_YYYYMMDD_)
+        # Formato correcto: S1A_IW_SLC__1SDV_YYYYMMDDTHHMMSS_YYYYMMDDTHHMMSS_AAAAAA_BBBBBB_CCCC_split.dim
+        # Formato incorrecto: SLC_YYYYMMDD_S1A_IW_SLC__1SDV_..._AAAAAA_..._split.dim
+        #                                                        ^^^^^^
+        #                                                   Absolute orbit
+        pattern = r'S1([ABC])_IW_SLC__1S\w+_\d{8}T\d{6}_\d{8}T\d{6}_(\d{6})_'
+        match = re.search(pattern, basename)
+        
+        if match:
+            satellite = match.group(1)  # A, B, o C
+            absolute_orbit = int(match.group(2))
+            
+            # Calcular track (órbita relativa)
+            if satellite in ['A', 'C']:
+                track = (absolute_orbit - 73) % 175 + 1
+            elif satellite == 'B':
+                track = (absolute_orbit - 27) % 175 + 1
+            else:
+                return None
+            
+            logger.debug(f"Track extraído de {basename}: {track} (órbita absoluta: {absolute_orbit}, sat: S1{satellite})")
+            return track
+    
+    # 4. Buscar symlinks en directorio padre/slc/ (workspace structure)
+    if slc_path.is_file():
+        # Estructura típica: workspace/preprocessed_slc/*.dim
+        #                    workspace/slc/*.SAFE (symlinks)
+        workspace_slc = slc_path.parent.parent / "slc"
+        if workspace_slc.exists():
+            safe_products = list(workspace_slc.glob("*.SAFE"))
+            if safe_products:
+                return repository.extract_track_from_slc(str(safe_products[0]))
+    
+    # 5. Leer metadata del .dim como último recurso
+    if str(slc_path).endswith('.dim') and slc_path.exists():
+        try:
+            import xml.etree.ElementTree as ET
+            tree = ET.parse(slc_path)
+            
+            # Buscar REL_ORBIT o relativeOrbitNumber en metadata
+            for elem in tree.iter():
+                if 'REL_ORBIT' in elem.tag or 'relativeOrbit' in elem.tag:
+                    track = int(elem.text)
+                    logger.debug(f"Track extraído de metadata XML: {track}")
+                    return track
+        except Exception as e:
+            logger.debug(f"No se pudo leer metadata XML: {e}")
+    
+    logger.warning(f"No se pudo extraer track number de: {slc_source}")
+    return None
+
+
 def main() -> int:
     import argparse
 
@@ -929,11 +1020,13 @@ def main() -> int:
 
     # Extraer track number del primer SLC si usamos repositorio
     if repository and track_number is None and len(slc_products) > 0:
-        track_number = repository.extract_track_from_slc(slc_products[0])
+        track_number = extract_track_number_robust(slc_products[0], repository)
         if track_number:
             logger.info(f"📡 Track detectado: {track_number}")
+            logger.info(f"   Repositorio: {repository.repo_base_dir}/{orbit_direction.lower()[:4]}_{subswath.lower()}/t{track_number:03d}/")
         else:
-            logger.warning("⚠️  No se pudo detectar track number - deshabilitando repositorio")
+            logger.warning("⚠️  No se pudo detectar track number - repositorio deshabilitado")
+            logger.warning(f"   Producto analizado: {slc_products[0]}")
             repository = None
 
     # Procesar pares (cortos + largos)

@@ -903,39 +903,51 @@ def download_sentinel2_products(workflow_config):
     """
     Descarga productos Sentinel-2 L2A para el AOI y rango de fechas
     
+    Siempre ejecuta la búsqueda de productos disponibles y descarga los que faltan.
+    El script download_copernicus.py maneja automáticamente qué descargar.
+    
     Args:
         workflow_config: Configuración del workflow con parámetros de descarga
 
     Returns:
-        bool: True si exitoso o si hay productos disponibles
+        bool: True si exitoso, False si falla (OBLIGATORIO)
     """
     logger.info(f"{'=' * 80}")
-    logger.info(f"PASO 2b: DESCARGA DE SENTINEL-2 L2A")
+    logger.info(f"PASO 2b: DESCARGA DE SENTINEL-2 L2A (OBLIGATORIO)")
     logger.info(f"{'=' * 80}")
     logger.info(f"Para cálculo de MSAVI (humedad del suelo)")
+    logger.info(f"Periodo: {workflow_config['start_date']} a {workflow_config['end_date']}")
     
-    # Verificar si ya hay productos Sentinel-2 descargados
+    # Listar productos existentes (solo informativo)
     s2_data_dir = Path("data") / "sentinel2_l2a"
     if s2_data_dir.exists():
         existing_products = list(s2_data_dir.glob("S2*_MSIL2A_*.SAFE"))
-        if len(existing_products) > 0:
-            logger.info(f"✓ Ya hay {len(existing_products)} productos Sentinel-2 descargados")
-            logger.info(f"  Saltando descarga (usar productos existentes)")
-            return True
+        if existing_products:
+            logger.info(f"Productos S2 existentes en disco: {len(existing_products)}")
+            logger.info(f"  (El sistema verificará cuáles descargar según disponibilidad en catálogo)")
+    
+    # SIEMPRE ejecutar descarga - el script maneja qué productos faltan
+    project_dir = Path("processing") / workflow_config["project_name"]
+    log_dir = project_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
     
     cmd = [
         sys.executable,
         "scripts/download_copernicus.py",
-        "--aoi-geojson", workflow_config["aoi_geojson"],
+        "--aoi-geojson", workflow_config["aoi_file"],
         "--start-date", workflow_config["start_date"],
         "--end-date", workflow_config["end_date"],
         "--collection", "SENTINEL-2",
-        "--product-type", workflow_config["product_type"]["sentinel2"],
+        "--product-type", workflow_config["products_to_download"]["sentinel_2"],
         "--yes",
-        "--min-coverage", workflow_config['min_coverage'],
+        "--min-coverage", str(workflow_config['min_coverage']),
+        "--log-dir", str(log_dir)
     ]
     
+    logger.info(f"")
+    logger.info(f"Ejecutando búsqueda y descarga de productos Sentinel-2...")
     logger.info(f"Comando: {' '.join(cmd)}")
+    logger.info(f"")
     
     try:
         result = subprocess.run(
@@ -944,24 +956,47 @@ def download_sentinel2_products(workflow_config):
             text=True
         )
         
-        if result.returncode == 0:
-            logger.info(f"✓ Productos Sentinel-2 descargados")
-            return True
-        else:
-            # Verificar si se descargó algo a pesar del error
-            if s2_data_dir.exists():
-                products = list(s2_data_dir.glob("S2*_MSIL2A_*.SAFE"))
-                if len(products) > 0:
-                    logger.info(f"✓ {len(products)} productos Sentinel-2 disponibles")
-                    return True
+        # Verificar resultado final
+        s2_data_dir = Path("data") / "sentinel2_l2a"
+        if s2_data_dir.exists():
+            final_products = list(s2_data_dir.glob("S2*_MSIL2A_*.SAFE"))
             
-            logger.warning(f"No se descargaron productos Sentinel-2")
-            logger.info(f"  MSAVI no estará disponible (opcional)")
-            return True  # No es crítico
+            # Filtrar por rango de fechas
+            start_dt = datetime.strptime(workflow_config["start_date"], '%Y-%m-%d')
+            end_dt = datetime.strptime(workflow_config["end_date"], '%Y-%m-%d')
+            
+            products_in_range = []
+            for product in final_products:
+                try:
+                    date_str = product.name.split('_')[2][:8]
+                    product_date = datetime.strptime(date_str, '%Y%m%d')
+                    if start_dt <= product_date <= end_dt:
+                        products_in_range.append((product, date_str))
+                except:
+                    continue
+            
+            if len(products_in_range) > 0:
+                logger.info(f"")
+                logger.info(f"{'=' * 80}")
+                logger.info(f"✓ Productos Sentinel-2 disponibles: {len(products_in_range)}")
+                for product, date_str in products_in_range[:5]:
+                    logger.info(f"  - {date_str}: {product.name}")
+                if len(products_in_range) > 5:
+                    logger.info(f"  ... y {len(products_in_range) - 5} más")
+                logger.info(f"{'=' * 80}")
+                return True
+            else:
+                logger.error(f"")
+                logger.error(f"✗ No hay productos Sentinel-2 disponibles en el rango {workflow_config['start_date']} a {workflow_config['end_date']}")
+                logger.error(f"  La descarga de Sentinel-2 es OBLIGATORIA para MSAVI")
+                return False
+        else:
+            logger.error(f"✗ No se encontró el directorio de Sentinel-2")
+            return False
             
     except Exception as e:
-        logger.error(f"✗ Error en descarga de Sentinel-2: {e}")
-        return True  # No es crítico para el workflow
+        logger.error(f"✗ Error CRÍTICO en descarga de Sentinel-2: {e}")
+        return False
 
 
 def process_msavi_for_project(project_name, aoi_file, start_date, end_date, log=None):
@@ -1335,12 +1370,14 @@ def main():
         logger.error(f"Error en descarga de productos SLC")
         workflow_config['download_products'] = False
 
-    # PASO 2b: Descargar productos Sentinel-2 para MSAVI
-    if download_sentinel2_products(workflow_config):
-        workflow_config['download_sentinel2'] = True
-    else:
-        logger.error(f"Error en descarga de productos Sentinel-2")
-        workflow_config['download_sentinel2'] = False
+    # PASO 2b: Descargar productos Sentinel-2 para MSAVI (OBLIGATORIO)
+    if not download_sentinel2_products(workflow_config):
+        logger.error(f"✗ Error CRÍTICO en descarga de productos Sentinel-2")
+        logger.error(f"  El workflow no puede continuar sin datos Sentinel-2")
+        print_summary(project_name, success=False, log=logger)
+        return 1
+    
+    workflow_config['download_sentinel2'] = True
 
     # PASO 3: Crear proyecto AOI
     if create_aoi_project(aoi_file, project_name):
