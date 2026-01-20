@@ -2138,6 +2138,30 @@ def check_final_products_complete(output_dir, series_config):
     output_path = Path(output_dir)
     cropped_dir = output_path / "insar" / "cropped"
     
+    # Verificar primero productos intermedios (.dim) si no hay cropped
+    if not cropped_dir.exists() or not any(cropped_dir.glob("Ifg_*_cropped.tif")):
+        # Verificar si existen productos InSAR intermedios (.dim) sin recortar
+        short_dir = output_path / "insar" / "short"
+        long_dir = output_path / "insar" / "long"
+        
+        if short_dir.exists() or long_dir.exists():
+            short_count = len(list(short_dir.glob("Ifg_*.dim"))) if short_dir.exists() else 0
+            long_count = len(list(long_dir.glob("Ifg_*.dim"))) if long_dir.exists() else 0
+            total_intermediate = short_count + long_count
+            
+            if total_intermediate > 0:
+                logger.info(f"ℹ️  Productos InSAR intermedios encontrados: {total_intermediate}")
+                logger.info(f"  Short: {short_count}, Long: {long_count}")
+                logger.info(f"  → Solo falta recorte al AOI, NO es necesario reprocesar InSAR")
+                
+                # Retornar como no completo pero con info de intermedios
+                return False, {
+                    'expected': 0,
+                    'existing': 0,
+                    'intermediate_count': total_intermediate,
+                    'message': 'Productos intermedios existen, solo falta recorte'
+                }
+    
     # Verificar que existe el directorio cropped
     if not cropped_dir.exists():
         return False, {
@@ -2647,11 +2671,41 @@ def main():
         logger.info(f"{'='*80}")
         logger.info(f"Productos finales: {info['existing']}/{info['expected']} (100%)")
         logger.info(f"Fechas: {len(info['dates'])} ({info['dates'][0]} → {info['dates'][-1]})")
-        logger.info(f"Directorio: {output_dir}/fusion/insar/cropped/")
+        logger.info(f"Directorio: {output_dir}/insar/cropped/")
         logger.info(f"")
         logger.info(f"→ SALTANDO TODO EL PROCESAMIENTO (ya completo)")
         logger.info(f"{'='*80}")
         return 0
+    elif info.get('intermediate_count', 0) > 0:
+        # Caso especial: existen productos InSAR intermedios pero no recortados
+        logger.info(f"{'='*80}")
+        logger.info(f"ℹ️  PRODUCTOS INSAR INTERMEDIOS YA EXISTEN")
+        logger.info(f"{'='*80}")
+        logger.info(f"Productos InSAR (.dim): {info['intermediate_count']}")
+        logger.info(f"Estado: Procesamiento InSAR completo")
+        logger.info(f"Falta: Solo recorte al AOI")
+        logger.info(f"")
+        logger.info(f"→ SALTANDO PREPROCESAMIENTO E INSAR")
+        logger.info(f"→ Solo se ejecutará el recorte al AOI")
+        logger.info(f"{'='*80}")
+        logger.info(f"")
+        
+        # Crear workspace mínimo para recorte
+        workspace = create_series_workspace(series_config, output_dir)
+        config_file = create_config_file(series_config, workspace)
+        
+        # Ejecutar SOLO el recorte
+        logger.info(f"\n{'=' * 80}")
+        logger.info(f"PASO: RECORTE DE PRODUCTOS INSAR AL AOI")
+        logger.info(f"{'=' * 80}\n")
+        
+        crop_success = run_insar_crop(workspace, series_config)
+        
+        if crop_success:
+            logger.info(f"\n✓ Recorte completado exitosamente")
+            logger.info(f"  Productos: {output_dir}/insar/cropped/")
+        
+        return 0 if crop_success else 1
     elif info['existing'] > 0:
         logger.info(f"{'='*80}")
         logger.info(f"⚠️  PROCESAMIENTO PARCIALMENTE COMPLETO")
