@@ -34,6 +34,9 @@ class LoggerConfig:
         log_dir.mkdir(parents=True, exist_ok=True)
 
         log_file = log_dir / f"{log_name}.log"
+        
+        # Limpiar log anterior si existe
+        LoggerConfig.clean_old_log(log_file)
 
         # Para el workflow completo, mostrar INFO en consola
         if console_level is None:
@@ -64,6 +67,9 @@ class LoggerConfig:
         log_dir.mkdir(parents=True, exist_ok=True)
 
         log_file = log_dir / f"{log_name}.log"
+        
+        # Limpiar log anterior si existe
+        LoggerConfig.clean_old_log(log_file)
 
         return LoggerConfig._setup_logger(
             name=f"series.{log_name}",
@@ -192,6 +198,44 @@ class LoggerConfig:
         """
         pct = (current / total) * 100 if total > 0 else 0
         logger.info(f"[{current}/{total}] ({pct:.1f}%) {item_name}")
+
+    @staticmethod
+    def clean_old_log(log_file):
+        """
+        Limpia un archivo de log existente antes de reprocesar
+        
+        Args:
+            log_file: Ruta al archivo de log a limpiar
+        """
+        log_path = Path(log_file)
+        if log_path.exists():
+            try:
+                log_path.unlink()
+            except Exception:
+                pass  # Ignorar errores si el archivo está en uso
+
+    @staticmethod
+    def clean_series_logs(series_dir):
+        """
+        Limpia TODOS los logs de una serie antes de reprocesar
+        Elimina logs con timestamp y logs regulares
+        
+        Args:
+            series_dir: Directorio de la serie
+        """
+        log_dir = Path(series_dir) / "logs"
+        if not log_dir.exists():
+            return
+        
+        try:
+            # Eliminar todos los archivos .log
+            for log_file in log_dir.glob("*.log"):
+                try:
+                    log_file.unlink()
+                except Exception:
+                    pass  # Ignorar errores
+        except Exception:
+            pass
 
     @staticmethod
     def log_exception(logger, msg, exc_info=True):

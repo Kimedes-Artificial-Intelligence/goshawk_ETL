@@ -2617,7 +2617,10 @@ def main():
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     
-    # Configurar logger ANTES de crear workspace
+    # LIMPIAR LOGS ANTIGUOS antes de iniciar nuevo procesamiento
+    LoggerConfig.clean_series_logs(str(output_path))
+    
+    # Configurar logger DESPUÉS de limpiar
     global logger
     logger = LoggerConfig.setup_series_logger(
         series_dir=str(output_path),
