@@ -36,16 +36,26 @@ from common_utils import get_snap_orbits_dir
 from insar_repository import InSARRepository
 
 # Database integration (optional - graceful degradation if not available)
+# ISSUE #5: Updated to use new db_queries API from Issue #2
+# ISSUE #6: Added S2 functions for Sentinel-2 tracking
 try:
-    from db_integration import register_slc_download, is_slc_downloaded
-    DB_INTEGRATION_AVAILABLE = True
+    from scripts.db_queries import (
+        register_slc_download, get_slc_status,
+        register_s2_download, get_s2_status
+    )
+    from scripts.db_integration import init_db
+    DB_INTEGRATION_AVAILABLE = init_db()
 except ImportError:
     DB_INTEGRATION_AVAILABLE = False
-    # Define no-op functions
+    # Define no-op functions for graceful degradation
     def register_slc_download(*args, **kwargs):
-        pass
-    def is_slc_downloaded(*args, **kwargs):
-        return False
+        return None
+    def get_slc_status(*args, **kwargs):
+        return None
+    def register_s2_download(*args, **kwargs):
+        return None
+    def get_s2_status(*args, **kwargs):
+        return None
 
 # importar las credenciales desde un archivo .env externo si existe
 from dotenv import load_dotenv
@@ -657,15 +667,25 @@ def download_product(
     output_file = os.path.join(download_dir, f"{product_name}.zip")
     extracted_dir = os.path.join(download_dir, product_name)
 
-    # CHECK DATABASE: Verificar si ya está registrado como descargado
-    if DB_INTEGRATION_AVAILABLE and is_slc_downloaded(product_name):
-        # Verificar que el archivo local realmente existe
-        if os.path.exists(extracted_dir):
-            manifest_file = os.path.join(extracted_dir, 'manifest.safe')
-            if os.path.exists(manifest_file):
-                logger.info(f"⏭️  Ya descargado (BD): {product_name}")
-                return True
-        # Si no existe localmente pero está en BD, continuar con descarga
+    # ISSUE #6: CHECK DATABASE: Verificar si ya está registrado como descargado (S1 or S2)
+    if DB_INTEGRATION_AVAILABLE:
+        # Detect product type
+        is_s2 = product_name.startswith('S2')
+        
+        if is_s2:
+            status = get_s2_status(product_name)
+        else:
+            status = get_slc_status(product_name)
+            
+        if status and status.get('downloaded', False):
+            # Verificar que el archivo local realmente existe
+            if os.path.exists(extracted_dir):
+                manifest_file = os.path.join(extracted_dir, 'manifest.safe')
+                if os.path.exists(manifest_file):
+                    logger.info(f"⏭️  Ya descargado (BD): {product_name}")
+                    return True
+            # Si no existe localmente pero está en BD, continuar con descarga
+            logger.debug(f"DB shows downloaded but file missing: {product_name}")
 
     # Verificar si ya existe (directorio extraído o .zip)
     if os.path.exists(extracted_dir):
@@ -864,39 +884,74 @@ def download_product(
                 except Exception:
                     pass
 
-                # REGISTER IN DATABASE: Registro exitoso en base de datos
+                # ISSUE #6: REGISTER IN DATABASE after successful download (S1 and S2)
                 if DB_INTEGRATION_AVAILABLE:
                     try:
                         # Extract metadata from product dict
                         parsed = parse_product_name(product_name)
                         acquisition_date = parsed.get('date')
+                        is_s2 = product_name.startswith('S2')
+                        
+                        if is_s2:
+                            # Sentinel-2 registration
+                            cloud_cover = None
+                            aoi_coverage = None
+                            
+                            # Extract cloud cover from attributes if available
+                            if 'Attributes' in product:
+                                for attr in product.get('Attributes', []):
+                                    if attr.get('Name') == 'cloudCover':
+                                        try:
+                                            cloud_cover = float(attr.get('Value', 0))
+                                        except:
+                                            pass
+                            
+                            if acquisition_date:
+                                product_id = register_s2_download(
+                                    scene_id=product_name,
+                                    acquisition_date=acquisition_date,
+                                    file_path=extracted_dir,
+                                    cloud_cover_percent=cloud_cover
+                                )
+                                
+                                if product_id:
+                                    cloud_info = f", cloud_cover={cloud_cover:.1f}%" if cloud_cover else ""
+                                    logger.info(f"   💾 Registered S2 in database (id={product_id}{cloud_info})")
+                                else:
+                                    logger.warning(f"   ⚠️  Failed to register S2 in database")
+                            else:
+                                logger.warning(f"   ⚠️  Missing date for S2 DB registration")
+                        else:
+                            # Sentinel-1 registration
+                            orbit_direction = "UNKNOWN"
+                            track_number = 0  # track_number = relative orbit for Sentinel-1
 
-                        # Extract orbit info from product attributes if available
-                        orbit_direction = "UNKNOWN"
-                        relative_orbit = 0
-                        absolute_orbit = 0
+                            if 'Attributes' in product:
+                                for attr in product.get('Attributes', []):
+                                    if attr.get('Name') == 'orbitDirection':
+                                        orbit_direction = attr.get('Value', 'UNKNOWN')
+                                    elif attr.get('Name') == 'relativeOrbitNumber':
+                                        track_number = int(attr.get('Value', 0))
 
-                        if 'Attributes' in product:
-                            for attr in product.get('Attributes', []):
-                                if attr.get('Name') == 'orbitDirection':
-                                    orbit_direction = attr.get('Value', 'UNKNOWN')
-                                elif attr.get('Name') == 'relativeOrbitNumber':
-                                    relative_orbit = int(attr.get('Value', 0))
-                                elif attr.get('Name') == 'orbitNumber':
-                                    absolute_orbit = int(attr.get('Value', 0))
+                            if acquisition_date and track_number > 0:
+                                product_id = register_slc_download(
+                                    scene_id=product_name,
+                                    acquisition_date=acquisition_date,
+                                    orbit_direction=orbit_direction,
+                                    track_number=track_number,
+                                    file_path=extracted_dir
+                                )
 
-                        if acquisition_date:
-                            register_slc_download(
-                                scene_id=product_name,
-                                acquisition_date=acquisition_date,
-                                file_path=extracted_dir,
-                                orbit_direction=orbit_direction,
-                                relative_orbit=relative_orbit,
-                                absolute_orbit=absolute_orbit,
-                            )
+                                if product_id:
+                                    logger.info(f"   💾 Registered S1 in database (id={product_id}, track={track_number})")
+                                else:
+                                    logger.warning(f"   ⚠️  Failed to register S1 in database")
+                            else:
+                                logger.warning(f"   ⚠️  Missing metadata for S1 DB registration (date={acquisition_date}, track={track_number})")
+
                     except Exception as e:
                         # Don't fail download if DB registration fails
-                        logger.debug(f"Could not register in database: {e}")
+                        logger.warning(f"   ⚠️  Could not register in database: {e}")
 
             except zipfile.BadZipFile:
                 logger.info(f"Error al extraer: archivo .zip corrupto")

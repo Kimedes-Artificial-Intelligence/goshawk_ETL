@@ -36,6 +36,18 @@ if script_dir not in sys.path:
 
 from logging_utils import LoggerConfig
 
+# ISSUE #6: Database integration for S2 tracking
+try:
+    from db_queries import get_s2_status, update_s2
+    from db_integration import init_db
+    DB_INTEGRATION_AVAILABLE = init_db()
+except ImportError:
+    DB_INTEGRATION_AVAILABLE = False
+    def get_s2_status(*args, **kwargs):
+        return None
+    def update_s2(*args, **kwargs):
+        return False
+
 logger = None
 
 
@@ -321,7 +333,20 @@ def process_sentinel2_to_msavi(product_path, output_path, aoi_geojson=None,
     Returns:
         bool: True si exitoso
     """
-    logger.info(f"Procesando: {os.path.basename(product_path)}")
+    product_name = os.path.basename(product_path).replace('.SAFE', '')
+    logger.info(f"Procesando: {product_name}")
+    
+    # ISSUE #6: CHECK DATABASE - Skip if already processed
+    if DB_INTEGRATION_AVAILABLE:
+        status = get_s2_status(product_name)
+        if status and status.get('msavi_processed', False):
+            # Verificar que el archivo existe
+            msavi_file = status.get('msavi_file_path')
+            if msavi_file and os.path.exists(msavi_file):
+                logger.info(f"  ⏭️  MSAVI ya procesado (BD): {msavi_file}")
+                return True
+            else:
+                logger.info(f"  ⚠️  BD indica procesado pero archivo no existe, reprocesando...")
     
     # 1. Buscar bandas B04, B08 y SCL
     logger.info("  Buscando bandas...")
@@ -426,6 +451,23 @@ def process_sentinel2_to_msavi(product_path, output_path, aoi_geojson=None,
         logger.info(f"    Max:    {np.max(msavi_valid):.3f}")
         logger.info(f"    Media:  {np.mean(msavi_valid):.3f}")
         logger.info(f"    Mediana:{np.median(msavi_valid):.3f}")
+    
+    # ISSUE #6: UPDATE DATABASE - Mark MSAVI as processed
+    if DB_INTEGRATION_AVAILABLE:
+        try:
+            success = update_s2(
+                product_name,
+                msavi_processed=True,
+                msavi_file_path=output_path,
+                msavi_date=datetime.now(),
+                msavi_version='1.0.0'
+            )
+            if success:
+                logger.info(f"  💾 Actualizado en base de datos")
+            else:
+                logger.warning(f"  ⚠️  No se pudo actualizar en BD (producto no registrado?)")
+        except Exception as e:
+            logger.warning(f"  ⚠️  Error actualizando BD: {e}")
     
     return True
 
