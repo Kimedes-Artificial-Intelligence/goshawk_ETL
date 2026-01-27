@@ -5,7 +5,7 @@ This module provides helper functions to integrate with the satelit_metadata dat
 for product traceability, preventing duplicate processing, and safe cleanup.
 
 Author: goshawk_ETL + satelit_metadata integration
-Version: 1.0
+Version: 2.0
 """
 
 import logging
@@ -19,7 +19,7 @@ from typing import Dict, List, Optional, Tuple
 try:
     from satelit_db.database import get_session
     from satelit_db.api import SatelitDBAPI
-    from satelit_db.models import Product, ProcessingRun
+    from sqlalchemy import text
 
     DB_AVAILABLE = True
 except ImportError:
@@ -27,6 +27,50 @@ except ImportError:
     logging.warning("satelit_db not available - database features disabled")
 
 logger = logging.getLogger(__name__)
+
+
+def init_db() -> bool:
+    """
+    Initialize the database schema with granular tracking tables.
+    
+    This function ensures that the new tables for S1/S2 granular tracking exist:
+    - slc_products: Sentinel-1 SLC tracking with per-subswath processing flags
+    - insar_pairs: Full-swath InSAR pair tracking
+    - s2_products: Sentinel-2 products with MSAVI tracking
+    - insar_pair_msavi: Integration between InSAR and MSAVI
+    
+    Returns:
+        True if tables exist or were created successfully, False otherwise
+    """
+    if not DB_AVAILABLE:
+        logger.error("Database not available - cannot initialize schema")
+        return False
+    
+    try:
+        with get_session() as session:
+            # Check if tables exist
+            result = session.execute(text("""
+                SELECT table_name 
+                FROM information_schema.tables 
+                WHERE table_schema = 'satelit' 
+                AND table_name IN ('slc_products', 'insar_pairs', 's2_products', 'insar_pair_msavi')
+            """))
+            existing_tables = {row[0] for row in result}
+            
+            required_tables = {'slc_products', 'insar_pairs', 's2_products', 'insar_pair_msavi'}
+            missing_tables = required_tables - existing_tables
+            
+            if missing_tables:
+                logger.warning(f"Missing tables: {missing_tables}")
+                logger.info("Please run: cd ../satelit_metadata && alembic upgrade head")
+                return False
+            
+            logger.info("✓ All granular tracking tables exist")
+            return True
+            
+    except Exception as e:
+        logger.error(f"Failed to check database schema: {e}")
+        return False
 
 
 class GoshawkDBIntegration:

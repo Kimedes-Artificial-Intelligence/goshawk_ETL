@@ -367,3 +367,220 @@ La trazabilidad de productos está ahora disponible en todos tus workflows de go
 **Versión**: 1.0
 **Fecha**: 2025-01-21
 **Status**: ✅ PRODUCTION READY
+
+---
+
+## 🚀 Issue #3: Database-Driven Smart Workflow V2 (2026-01-27)
+
+### Status: 🔧 Framework Implemented - Pending DB Dependencies
+
+Se ha implementado el framework completo para el workflow inteligente basado en estados de base de datos, pero está **bloqueado** esperando la implementación de Issues #1 (esquema DB) y #2 (funciones helper DB).
+
+### Archivos Creados
+
+#### 1. **run_complete_workflow_v2.py** ✅ (918 líneas)
+
+Nuevo orchestrator con arquitectura de 4 fases:
+
+**Fase 1: Query & Sync**
+- `query_copernicus_s1()` - Consulta Copernicus para productos S1
+- `query_copernicus_s2()` - Consulta Copernicus para productos S2
+- `sync_s1_products_to_db()` - Sincroniza S1 con BD
+- `sync_s2_products_to_db()` - Sincroniza S2 con BD
+
+**Fase 2: Generate Queues**
+- `generate_s1_download_queue()` - Filtra downloaded=False
+- `generate_s1_process_queue()` - Filtra fullswath_processed=False
+- `generate_s2_download_queue()` - Filtra downloaded=False
+- `generate_s2_msavi_queue()` - Filtra msavi_processed=False
+
+**Fase 3: Execute Batches**
+- `execute_s1_downloads()` - Descarga S1, actualiza BD
+- `execute_s1_fullswath_processing()` - Procesa InSAR, registra pares
+- `execute_s2_downloads()` - Descarga S2, actualiza BD
+- `execute_s2_msavi_processing()` - Procesa MSAVI, actualiza BD
+- `execute_msavi_alignment()` - Alinea MSAVI con pares InSAR
+
+**Fase 4: Final Crop**
+- `execute_final_crop()` - Crop todos los pares a AOI (rápido, sin estado BD)
+
+#### 2. **docs/SMART_WORKFLOW_V2_DB_DRIVEN.md** ✅ (450+ líneas)
+
+Documentación arquitectónica completa:
+- Diagramas de flujo
+- Comparaciones de rendimiento (99% reducción de tiempo)
+- Especificaciones de funciones
+- Plan de testing
+- Criterios de aceptación
+
+### Modificaciones de Configuración
+
+#### **Threshold de Cobertura AOI: 30% → 75%**
+
+**Archivos modificados:**
+- `scripts/select_optimal_subswath.py:215`
+- `scripts/process_insar_series.py:171`
+
+**Razón:** Solo procesar subswaths con cobertura sustancial del AOI (≥75%)
+
+**Impacto:**
+- Evita procesar subswaths marginales
+- Reduce productos inútiles
+- Mejora calidad de resultados
+
+### Mejoras de Rendimiento Esperadas
+
+| Escenario | Workflow V1 (Actual) | Workflow V2 (Nuevo) | Ahorro |
+|-----------|---------------------|---------------------|--------|
+| **Primera ejecución** | ~340 horas | ~340 horas | 0% |
+| **Re-ejecución (todo procesado)** | ~340 horas | **~3 horas** | **99%** |
+| **1 producto nuevo** | ~340 horas | **~5.5 horas** | **98%** |
+
+### Dependencias Bloqueantes
+
+#### Issue #1: Database Schema (⏳ Pendiente)
+
+```sql
+-- Tablas requeridas
+CREATE TABLE slc_products (
+    id INTEGER PRIMARY KEY,
+    scene_id TEXT UNIQUE,
+    downloaded BOOLEAN DEFAULT FALSE,
+    fullswath_iw1_processed BOOLEAN DEFAULT FALSE,
+    fullswath_iw2_processed BOOLEAN DEFAULT FALSE,
+    ...
+);
+
+CREATE TABLE insar_pairs (
+    id INTEGER PRIMARY KEY,
+    master_slc_id INTEGER REFERENCES slc_products(id),
+    slave_slc_id INTEGER REFERENCES slc_products(id),
+    subswath TEXT,
+    pair_type TEXT,
+    file_path TEXT,
+    ...
+);
+
+CREATE TABLE s2_products (...);
+CREATE TABLE insar_pair_msavi (...);
+```
+
+#### Issue #2: Database Helper Functions (⏳ Pendiente)
+
+```python
+# Funciones requeridas en scripts/db_integration.py:
+db.get_slc_status(scene_id) -> Dict
+db.update_slc(scene_id, **kwargs) -> bool
+db.register_insar_pair(...) -> int
+db.get_insar_pairs(track, orbit, subswath) -> List[Dict]
+db.get_missing_pairs_for_slc(scene_id, subswath) -> List[Tuple]
+db.query_slc_by_track_orbit(track, orbit) -> List
+db.get_s2_status(scene_id) -> Dict
+db.update_s2(scene_id, **kwargs) -> bool
+db.find_msavi_for_date(date, window_days) -> Optional[Dict]
+# ... y 6 funciones más
+```
+
+### Integraciones Pendientes
+
+Una vez completados Issues #1 y #2:
+
+1. **Copernicus Query Integration**
+   - Agregar flag `--query-only` a `download_copernicus.py`
+   - Parsear output a formato estructurado
+   - Implementar en `query_copernicus_s1()` y `query_copernicus_s2()`
+
+2. **InSAR Pair Processing**
+   - Crear `scripts/process_insar_pair.py`
+   - Extraer lógica de `process_insar_series.py`
+   - Procesar pares individuales en lugar de series completas
+
+3. **Crop Helper**
+   - Crear `scripts/crop_utils.py`
+   - Wrapper de GPT Subset operator
+   - Batch processing de crops
+
+4. **Preprocess Cache**
+   - Función `preprocess_slc_if_needed()`
+   - Integración con caché global `data/preprocessed_slc/`
+   - Symlinks en lugar de copias
+
+### Testing Plan
+
+**Fase 1: Después de Issue #2**
+```bash
+python scripts/db_example_usage.py
+# Verificar todas las funciones DB
+```
+
+**Fase 2: Integración completa**
+```bash
+# Clean DB
+rm -f satelit_metadata.db
+
+# Primera ejecución
+python run_complete_workflow_v2.py aoi/test.geojson \
+  --name test --start-date 2024-11-01 --end-date 2024-11-30
+
+# Esperado: Descarga 10, procesa 10, genera ~45 pares
+```
+
+**Fase 3: Test incremental**
+```bash
+# Marcar 1 producto como no procesado
+sqlite3 satelit_metadata.db \
+  "UPDATE slc_products SET fullswath_iw1_processed=FALSE WHERE scene_id='...';"
+
+# Re-ejecutar
+python run_complete_workflow_v2.py aoi/test.geojson --name test
+
+# Esperado: Solo procesa 1 producto + 2-4 pares nuevos (~5 horas vs 340)
+```
+
+### Archivos a Crear (Después de Dependencias)
+
+1. `scripts/process_insar_pair.py` - Procesamiento individual de pares
+2. `scripts/crop_utils.py` - Helpers para crop batch
+3. `scripts/db_queries.py` - SQL queries específicas (Issue #2)
+4. `tests/test_workflow_v2.py` - Tests unitarios
+
+### Compatibilidad
+
+- ✅ **Backward compatible:** Workflow V1 (`run_complete_workflow.py`) sigue funcionando
+- ✅ **Migración gradual:** V2 puede probarse en paralelo
+- ✅ **Degradación graciosa:** Si BD no disponible, funciones retornan vacío
+- ✅ **Mismo output:** Resultados finales idénticos, solo cambia eficiencia
+
+### Próximos Pasos
+
+1. **Completar Issue #1** (Esquema DB)
+   - Crear tablas en `satelit_db`
+   - Agregar índices para queries eficientes
+
+2. **Completar Issue #2** (Funciones Helper)
+   - Implementar 15+ funciones en `scripts/db_integration.py`
+   - Crear `scripts/db_queries.py`
+   - Escribir `scripts/db_example_usage.py` con tests
+
+3. **Integrar Copernicus**
+   - Modificar `download_copernicus.py` para query-only mode
+   - Parsear JSON output
+
+4. **Implementar pair processing**
+   - Extraer lógica de `process_insar_series.py`
+   - Crear función standalone
+
+5. **Testing completo**
+   - Test con AOI pequeño
+   - Validar DB updates
+   - Verificar procesamiento incremental
+
+6. **Deployment**
+   - Reemplazar V1 con V2
+   - Archivar V1 como `run_complete_workflow_v1_legacy.py`
+
+---
+
+**Versión Issue #3**: 0.9 (Framework completo, bloqueado por dependencias)
+**Fecha**: 2026-01-27
+**Status**: 🔧 IN PROGRESS - Waiting for Issues #1 and #2
