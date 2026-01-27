@@ -1060,6 +1060,29 @@ def main() -> int:
             processed += 1
             continue
 
+        # ISSUE #4: Check database for existing InSAR pair
+        # Extract scene_id from file paths
+        master_scene_id = os.path.basename(master).replace('.SAFE', '').replace('.dim', '').split('_Orb')[0].split('_Stack')[0]
+        slave_scene_id = os.path.basename(slave).replace('.SAFE', '').replace('.dim', '').split('_Orb')[0].split('_Stack')[0]
+
+        try:
+            from scripts.db_queries import insar_pair_exists
+            from scripts.db_integration import init_db
+
+            if not hasattr(insar_pair_exists, '_db_checked'):
+                # Initialize DB only once
+                insar_pair_exists._db_available = init_db()
+                insar_pair_exists._db_checked = True
+
+            if insar_pair_exists._db_available:
+                if insar_pair_exists(master_scene_id, slave_scene_id, subswath, pair_type):
+                    logger.info(f"[{idx}/{total_pairs}] 💾 Pair exists in database: {pair_name} ({pair_type}) - skipping")
+                    skipped_from_repo += 1
+                    processed += 1
+                    continue
+        except ImportError:
+            pass  # DB not available, continue with normal processing
+
         # VERIFICAR REPOSITORIO ANTES DE PROCESAR
         if repository and args.use_repository and track_number:
             try:
@@ -1175,6 +1198,37 @@ def main() -> int:
 
                 except Exception as e:
                     logger.warning(f"  ⚠️  Error guardando al repositorio: {e}")
+
+            # ISSUE #4: Register InSAR pair in database
+            try:
+                from scripts.db_queries import register_insar_pair
+                from datetime import datetime
+
+                if hasattr(insar_pair_exists, '_db_available') and insar_pair_exists._db_available:
+                    # Calculate temporal baseline
+                    from datetime import datetime as dt
+                    master_dt = dt.strptime(master_date[:8], '%Y%m%d')
+                    slave_dt = dt.strptime(slave_date[:8], '%Y%m%d')
+                    temporal_baseline_days = abs((slave_dt - master_dt).days)
+
+                    pair_id = register_insar_pair(
+                        master_scene_id=master_scene_id,
+                        slave_scene_id=slave_scene_id,
+                        pair_type=pair_type,
+                        subswath=subswath,
+                        temporal_baseline_days=temporal_baseline_days,
+                        file_path=str(Path(output_file).absolute()),
+                        processing_version='2.0'
+                    )
+
+                    if pair_id:
+                        logger.debug(f"  💾 Registered in database (pair_id={pair_id})")
+                    else:
+                        logger.warning(f"  ⚠️  Failed to register pair in database")
+            except ImportError:
+                pass  # DB not available
+            except Exception as e:
+                logger.warning(f"  ⚠️  Error registering in database: {e}")
 
             processed += 1
         else:

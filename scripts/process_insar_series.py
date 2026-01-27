@@ -718,6 +718,70 @@ def run_preprocessing(workspace, config_file, required_slc_dates=None):
             with open(config_json) as f:
                 series_config = json.load(f)
 
+    # ISSUE #4: Check database for already processed full-swath products
+    # Import DB functions
+    try:
+        from scripts.db_queries import get_slc_status
+        from scripts.db_integration import init_db
+        DB_AVAILABLE = init_db()
+    except ImportError:
+        DB_AVAILABLE = False
+        logger.debug("Database not available - skipping DB checks")
+
+    if DB_AVAILABLE and series_config:
+        subswath = series_config.get('subswath', 'IW1')
+        logger.info(f"🔍 Checking database for already processed full-swath products ({subswath})...")
+
+        # Get list of SLC files to process
+        slc_dir = workspace['slc']
+        slc_files = sorted(slc_dir.glob('*.SAFE'))
+
+        if slc_files:
+            db_skipped = 0
+            for slc_path in slc_files:
+                scene_id = slc_path.name.replace('.SAFE', '')
+
+                # Filter by required_slc_dates if specified
+                if required_slc_dates:
+                    slc_date = extract_date_from_filename(scene_id)
+                    if slc_date and slc_date[:8] not in required_slc_dates:
+                        continue
+
+                status = get_slc_status(scene_id)
+                if status:
+                    processed_flag = f'fullswath_{subswath.lower()}_processed'
+                    if status.get(processed_flag, False):
+                        logger.info(f"  ✓ {scene_id[:30]}... already processed in DB (skip)")
+                        db_skipped += 1
+
+                        # TODO: Link from repository to workspace if not already present
+                        # This would require knowing the repository structure
+
+            if db_skipped > 0:
+                logger.info(f"\n  📊 DB Check: {db_skipped} SLC already fully processed")
+                # Update required_slc_dates to exclude DB-processed products
+                if required_slc_dates is not None:
+                    # Filter out dates that are fully processed
+                    filtered_dates = set()
+                    for slc_path in slc_files:
+                        scene_id = slc_path.name.replace('.SAFE', '')
+                        slc_date = extract_date_from_filename(scene_id)
+                        if slc_date and slc_date[:8] in required_slc_dates:
+                            status = get_slc_status(scene_id)
+                            processed_flag = f'fullswath_{subswath.lower()}_processed'
+                            if not status or not status.get(processed_flag, False):
+                                filtered_dates.add(slc_date[:8])
+
+                    if not filtered_dates:
+                        logger.info(f"  🎉 ALL required SLC already processed in database!")
+                        logger.info(f"  → Skipping preprocessing completely\n")
+                        return True
+
+                    required_slc_dates = filtered_dates
+                    logger.info(f"  → {len(required_slc_dates)} SLC still need preprocessing\n")
+            else:
+                logger.info(f"  → No SLC found in database, proceeding with preprocessing\n")
+
     cache_result = check_global_preprocessed_cache(series_config, required_slc_dates)
 
     # Crear symlinks para productos encontrados en caché
@@ -841,6 +905,47 @@ def run_preprocessing(workspace, config_file, required_slc_dates=None):
         preprocessed_count = len(list(workspace['preprocessed'].glob('*.dim')))
         logger.info(f"\n✓ Pre-procesamiento completado")
         logger.info(f"  Productos preprocesados: {preprocessed_count}")
+
+        # ISSUE #4: Update database with preprocessing completion
+        # Note: Since preprocessing happens in subprocess, we update DB based on
+        # what preprocessed products now exist in the workspace
+        if DB_AVAILABLE and series_config:
+            logger.info(f"\n📝 Updating database with preprocessing status...")
+            from scripts.db_queries import update_slc
+
+            subswath = series_config.get('subswath', 'IW1')
+            preprocessed_files = list(workspace['preprocessed'].glob('*.dim'))
+
+            updated_count = 0
+            for preprocessed_file in preprocessed_files:
+                # Extract scene_id from preprocessed filename
+                # Preprocessed files are named like: S1A_IW_SLC__1SDV_20240901T055322_...
+                filename = preprocessed_file.stem  # Remove .dim extension
+                # Try to match original scene_id pattern
+                if 'S1' in filename and 'SLC' in filename:
+                    # Extract the scene_id portion (before any preprocessing suffixes)
+                    scene_id = filename.split('_Orb')[0]  # Remove _Orb suffix if present
+                    scene_id = scene_id.split('_Stack')[0]  # Remove _Stack suffix if present
+
+                    # Update DB flag for this subswath
+                    success = update_slc(
+                        scene_id,
+                        **{
+                            f'fullswath_{subswath.lower()}_processed': True,
+                            f'fullswath_{subswath.lower()}_date': datetime.now(),
+                            f'fullswath_{subswath.lower()}_version': '2.0'
+                        }
+                    )
+
+                    if success:
+                        updated_count += 1
+                        logger.debug(f"  ✓ Updated DB: {scene_id[:30]}...")
+
+            if updated_count > 0:
+                logger.info(f"  ✓ Updated {updated_count} SLC records in database")
+            else:
+                logger.warning(f"  ⚠️  No database records updated (may need manual sync)")
+
         return True
     else:
         logger.warning(f"\n⚠️  Pre-procesamiento tuvo problemas")
