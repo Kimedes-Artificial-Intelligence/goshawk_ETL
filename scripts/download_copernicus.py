@@ -35,6 +35,18 @@ from logging_utils import LoggerConfig
 from common_utils import get_snap_orbits_dir
 from insar_repository import InSARRepository
 
+# Database integration (optional - graceful degradation if not available)
+try:
+    from db_integration import register_slc_download, is_slc_downloaded
+    DB_INTEGRATION_AVAILABLE = True
+except ImportError:
+    DB_INTEGRATION_AVAILABLE = False
+    # Define no-op functions
+    def register_slc_download(*args, **kwargs):
+        pass
+    def is_slc_downloaded(*args, **kwargs):
+        return False
+
 # importar las credenciales desde un archivo .env externo si existe
 from dotenv import load_dotenv
 load_dotenv()
@@ -334,8 +346,11 @@ def search_products(
     }
     headers = {"Authorization": f"Bearer {token}"}
 
+    # Sentinel-2 necesita más tiempo por mayor volumen de productos
+    timeout = 180 if collection == "SENTINEL-2" else 60
+
     try:
-        response = requests.get(url, params=params, headers=headers, timeout=60)
+        response = requests.get(url, params=params, headers=headers, timeout=timeout)
         response.raise_for_status()
 
         products = response.json().get('value', [])
@@ -642,6 +657,16 @@ def download_product(
     output_file = os.path.join(download_dir, f"{product_name}.zip")
     extracted_dir = os.path.join(download_dir, product_name)
 
+    # CHECK DATABASE: Verificar si ya está registrado como descargado
+    if DB_INTEGRATION_AVAILABLE and is_slc_downloaded(product_name):
+        # Verificar que el archivo local realmente existe
+        if os.path.exists(extracted_dir):
+            manifest_file = os.path.join(extracted_dir, 'manifest.safe')
+            if os.path.exists(manifest_file):
+                logger.info(f"⏭️  Ya descargado (BD): {product_name}")
+                return True
+        # Si no existe localmente pero está en BD, continuar con descarga
+
     # Verificar si ya existe (directorio extraído o .zip)
     if os.path.exists(extracted_dir):
         # Verificar integridad: debe existir manifest.safe
@@ -838,6 +863,40 @@ def download_product(
                     logger.info(f"Archivo .zip eliminado (ahorrando {final_size/(1024**3):.2f} GB)")
                 except Exception:
                     pass
+
+                # REGISTER IN DATABASE: Registro exitoso en base de datos
+                if DB_INTEGRATION_AVAILABLE:
+                    try:
+                        # Extract metadata from product dict
+                        parsed = parse_product_name(product_name)
+                        acquisition_date = parsed.get('date')
+
+                        # Extract orbit info from product attributes if available
+                        orbit_direction = "UNKNOWN"
+                        relative_orbit = 0
+                        absolute_orbit = 0
+
+                        if 'Attributes' in product:
+                            for attr in product.get('Attributes', []):
+                                if attr.get('Name') == 'orbitDirection':
+                                    orbit_direction = attr.get('Value', 'UNKNOWN')
+                                elif attr.get('Name') == 'relativeOrbitNumber':
+                                    relative_orbit = int(attr.get('Value', 0))
+                                elif attr.get('Name') == 'orbitNumber':
+                                    absolute_orbit = int(attr.get('Value', 0))
+
+                        if acquisition_date:
+                            register_slc_download(
+                                scene_id=product_name,
+                                acquisition_date=acquisition_date,
+                                file_path=extracted_dir,
+                                orbit_direction=orbit_direction,
+                                relative_orbit=relative_orbit,
+                                absolute_orbit=absolute_orbit,
+                            )
+                    except Exception as e:
+                        # Don't fail download if DB registration fails
+                        logger.debug(f"Could not register in database: {e}")
 
             except zipfile.BadZipFile:
                 logger.info(f"Error al extraer: archivo .zip corrupto")
@@ -1422,6 +1481,15 @@ Ejemplos:
     # Banner
     logger.info("="*80)
     logger.info("DESCARGADOR COPERNICUS DATASPACE")
+    logger.info("="*80)
+
+    # Database integration status
+    if DB_INTEGRATION_AVAILABLE:
+        logger.info("🗄️  Database integration: ENABLED (satelit_metadata)")
+        logger.info("   - Preventing duplicate downloads")
+        logger.info("   - Tracking product traceability")
+    else:
+        logger.info("🗄️  Database integration: DISABLED (install satelit_db for tracking)")
     logger.info("="*80)
 
     # Obtener credenciales

@@ -168,12 +168,9 @@ def validate_subswath_coverage_before_processing(series_config, workspace):
             intersection = swath_box.intersection(aoi_poly)
             coverage = (intersection.area / aoi_poly.area) * 100 if aoi_poly.area > 0 else 0.0
 
-            if coverage < 10.0:
+            if coverage < 75.0:
                 return (False, coverage,
-                        f"Subswath {subswath} tiene solo {coverage:.1f}% de cobertura del AOI")
-            elif coverage < 50.0:
-                return (True, coverage,
-                        f"⚠️ Subswath {subswath} tiene cobertura parcial ({coverage:.1f}%)")
+                        f"Subswath {subswath} tiene solo {coverage:.1f}% de cobertura del AOI (mínimo requerido: 75%)")
             else:
                 return (True, coverage,
                         f"✓ Subswath {subswath} cubre {coverage:.1f}% del AOI")
@@ -2765,8 +2762,10 @@ def main():
         logger.error(f"{'=' * 80}\n")
         return 2  # Exit code 2 = validación previa fallida
 
-    if coverage_pct > 0 and coverage_pct < 50:
-        logger.warning(f"\n⚠️  ADVERTENCIA: Cobertura parcial ({coverage_pct:.1f}%)")
+    # Nota: Esta advertencia ya no debería aparecer con el umbral de 75%
+    # pero se mantiene para casos edge donde la validación pueda variar
+    if coverage_pct > 0 and coverage_pct < 75:
+        logger.warning(f"\n⚠️  ADVERTENCIA: Cobertura bajo el umbral recomendado ({coverage_pct:.1f}%)")
         logger.warning(f"  Se recomienda verificar si otro subswath tiene mejor cobertura")
         logger.warning(f"  Continuando con el procesamiento...\n")
 

@@ -204,16 +204,16 @@ def calculate_coverage_quality(aoi_bbox: Dict[str, float], subswath_bbox: Dict[s
     coverage_pct = (intersection_area / aoi_area) * 100 if aoi_area > 0 else 0
     
     # Verificar tamaño mínimo de intersección (grados²)
-    # AOI típico de pueblo: ~0.0001-0.01 grados² 
-    # Intersección mínima requerida: 30% del AOI o 0.0001 grados² (lo que sea mayor)
-    MIN_INTERSECTION_AREA = max(0.0001, aoi_area * 0.30)
-    
+    # AOI típico de pueblo: ~0.0001-0.01 grados²
+    # Intersección mínima requerida: 75% del AOI o 0.0001 grados² (lo que sea mayor)
+    MIN_INTERSECTION_AREA = max(0.0001, aoi_area * 0.75)
+
     if intersection_area < MIN_INTERSECTION_AREA:
         return (False, coverage_pct, f"Intersección muy pequeña ({intersection_area:.6f}°² < {MIN_INTERSECTION_AREA:.6f}°²)")
-    
-    # Verificar que cubra al menos 30% del AOI (reducido de 50%)
-    if coverage_pct < 30.0:
-        return (False, coverage_pct, f"Cobertura insuficiente ({coverage_pct:.1f}% < 30%)")
+
+    # Verificar que cubra al menos 75% del AOI
+    if coverage_pct < 75.0:
+        return (False, coverage_pct, f"Cobertura insuficiente ({coverage_pct:.1f}% < 75%)")
     
     # Verificar distancia a bordes del subswath (detectar zonas marginales)
     # Calcular qué tan cerca está el AOI de los bordes del subswath
@@ -317,19 +317,19 @@ def get_product_date(product_name):
     return None
 
 
-def validate_actual_data_coverage(product_dir: Path, subswath: str, aoi_bbox: Dict[str, float], 
-                                  min_coverage_pct: float = 50.0) -> Tuple[bool, float]:
+def validate_actual_data_coverage(product_dir: Path, subswath: str, aoi_bbox: Dict[str, float],
+                                  min_coverage_pct: float = 75.0) -> Tuple[bool, float]:
     """
     Valida que el subswath tiene DATOS REALES válidos (no solo bbox) cubriendo el AOI.
-    
+
     Lee el archivo de medición (measurement) del subswath y verifica el porcentaje
     de píxeles con datos válidos (no-zero, no-NaN) dentro del AOI.
-    
+
     Args:
         product_dir: Directorio del producto .SAFE
         subswath: Sub-swath a verificar (e.g., 'IW1')
         aoi_bbox: Bounding box del AOI
-        min_coverage_pct: Porcentaje mínimo de cobertura requerido (default 50%)
+        min_coverage_pct: Porcentaje mínimo de cobertura requerido (default 75%)
         
     Returns:
         Tuple (has_valid_coverage: bool, coverage_percentage: float)

@@ -37,6 +37,16 @@ from typing import Dict, List, Optional, Tuple
 from shapely.geometry import shape, Polygon, box
 from shapely import wkt
 
+# Database integration (optional - graceful degradation if not available)
+try:
+    from db_integration import register_insar_product
+    DB_INTEGRATION_AVAILABLE = True
+except ImportError:
+    DB_INTEGRATION_AVAILABLE = False
+    # Define no-op function
+    def register_insar_product(*args, **kwargs):
+        pass
+
 logger = logging.getLogger(__name__)
 
 
@@ -362,6 +372,30 @@ class InSARRepository:
 
                 logger.info(f"  ✓ {dim_file.name} ({product_info['size_gb']:.2f} GB)")
 
+                # REGISTER IN DATABASE: Registro en base de datos
+                if DB_INTEGRATION_AVAILABLE:
+                    try:
+                        # Build full scene IDs (simplified - would need actual SLC names)
+                        master_scene_id = f"S1_IW_SLC_{product_info['master_date']}"
+                        slave_scene_id = f"S1_IW_SLC_{product_info['slave_date']}"
+
+                        # Extract track from directory path
+                        track_num = track
+
+                        register_insar_product(
+                            master_scene_id=master_scene_id,
+                            slave_scene_id=slave_scene_id,
+                            pair_type=pair_type,
+                            output_path=str(dest_dim),
+                            temporal_baseline_days=product_info['temporal_baseline_days'],
+                            subswath=subswath,
+                            orbit_direction=orbit_direction,
+                            track_number=track_num,
+                        )
+                        logger.debug(f"  ✓ Registered in database with subswath={subswath}")
+                    except Exception as e:
+                        logger.debug(f"  Could not register in database: {e}")
+
         # 2. Copiar productos Polarimétricos
         logger.info(f"\n2. Copiando productos Polarimétricos...")
         source_pol = source_workspace / "fusion" / "polarimetry"
@@ -399,6 +433,47 @@ class InSARRepository:
 
                 stats['polarimetry_added'] += 1
                 logger.info(f"  ✓ {date}/{dim_file.name} ({product_info['size_gb']:.2f} GB)")
+
+                # REGISTER IN DATABASE: Registro en base de datos
+                if DB_INTEGRATION_AVAILABLE:
+                    try:
+                        # Build source scene ID (simplified - would need actual SLC name)
+                        source_scene_id = f"S1_IW_SLC_{date}"
+
+                        # Import register function
+                        from db_integration import get_db_integration
+                        from satelit_db.database import get_session
+                        from satelit_db.api import SatelitDBAPI
+
+                        db = get_db_integration()
+                        if db.enabled:
+                            with get_session() as session:
+                                api = SatelitDBAPI(session)
+
+                                # Register polarimetry product
+                                polar_product = api.register_polarimetry_product(
+                                    source_scene_id=source_scene_id,
+                                    decomposition_type="H-Alpha Dual Pol",
+                                    subswath=subswath,
+                                    orbit_direction=orbit_direction,
+                                    track_number=track,
+                                )
+
+                                # Update status
+                                polar_product.processing_status = "PROCESSED"
+
+                                # Add storage location
+                                api.add_storage_location(
+                                    product_id=polar_product.id,
+                                    storage_type="POLARIMETRY_PRODUCT",
+                                    file_path=str(dest_dim),
+                                    file_format="BEAM-DIMAP",
+                                    calculate_size=True,
+                                )
+
+                                logger.debug(f"  ✓ Registered in database with subswath={subswath}")
+                    except Exception as e:
+                        logger.debug(f"  Could not register polarimetry in database: {e}")
 
         # 3. Guardar metadata (estadísticas y temporal_range se actualizan automáticamente en save_metadata)
         self.save_metadata(orbit_direction, subswath, track, metadata)

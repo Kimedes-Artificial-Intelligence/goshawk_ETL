@@ -51,3 +51,10 @@ dependencies:
     - python-dotenv
     - asf_search  # Alaska Satellite Facility
     - xmltodict  # XML parsing for orbit files validation
+    # Database integration for product traceability
+    - sqlalchemy>=2.0.0
+    - geoalchemy2>=0.14.0
+    - psycopg2-binary>=2.9.9
+    - rich>=13.7.0
+    - tabulate>=0.9.0
+    - -e ../satelit_metadata  # Satelit metadata database

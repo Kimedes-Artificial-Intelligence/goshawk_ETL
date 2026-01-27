@@ -36,8 +36,6 @@ from pathlib import Path
 # Importar sistema de logging centralizado y utilidades comunes
 sys.path.append(os.path.join(os.path.dirname(__file__), 'scripts'))
 from scripts.logging_utils import LoggerConfig
-from scripts.smart_workflow_planner import SmartWorkflowPlanner
-from scripts.db_integration import get_db_integration
 
 logger = None  # Se configurará después de seleccionar AOI
 
@@ -278,17 +276,6 @@ def download_products(workflow_config):
     logger.info(f"{'=' * 80}")
     logger.info(f"PASO 2: DESCARGA DE PRODUCTOS {workflow_config.get('products_to_download', {}).get('sentinel_1', 'SLC')}")
     logger.info(f"{'=' * 80}")
-
-    # 🧠 SMART WORKFLOW: Verificar si necesita descarga
-    smart_plan = workflow_config.get('smart_plan')
-    if smart_plan and workflow_config.get('use_smart_optimizations'):
-        # Verificar si algún track necesita descarga
-        needs_download = any(d.needs_download for d in smart_plan.values())
-        if not needs_download:
-            logger.info("⚡ SMART WORKFLOW: Todos los productos ya descargados")
-            logger.info("   Saltando descarga de productos...")
-            return True  # Skip download
-
     logger.info(f"Filtrando productos con 100% de cobertura del AOI")
 
     # Asegurar que existe el directorio de logs del proyecto
@@ -679,7 +666,7 @@ def evaluate_orbit_processing_quality(project_name, orbit_direction, log=None):
     return result
 
 
-def run_processing(project_name, orbit_direction, use_repository=True, save_to_repository=True, covering_subswaths=None):
+def run_processing(project_name, orbit_direction, use_repository=True, save_to_repository=True):
     """
     Ejecuta el procesamiento completo del proyecto para una órbita específica
 
@@ -690,7 +677,6 @@ def run_processing(project_name, orbit_direction, use_repository=True, save_to_r
         orbit_direction: Dirección de órbita (DESCENDING o ASCENDING)
         use_repository: Buscar productos en repositorio antes de procesar (default: True)
         save_to_repository: Guardar productos al repositorio después de procesar (default: True)
-        covering_subswaths: Set de subswaths que cubren el AOI (e.g., {'IW1', 'IW2'}), None para procesar todos
 
     Returns:
         bool: True si exitoso
@@ -728,41 +714,16 @@ def run_processing(project_name, orbit_direction, use_repository=True, save_to_r
     failed_count = 0
     processed_iws = []  # IWs que se procesaron exitosamente
     failed_iws = []     # IWs sin cobertura del AOI
-    skipped_iws = []    # IWs saltadas por no cubrir el AOI
 
     # Filtrar solo IW1 e IW2 (excluir IW3)
-    config_files_filtered = [cf for cf in config_files
+    config_files_filtered = [cf for cf in config_files 
                             if cf.stem.replace("selected_products_", "").split('_')[-1].lower() in ['iw1', 'iw2']]
-
+    
     if not config_files_filtered:
         logger.error(f"✗ No se encontraron configuraciones IW1/IW2 para {orbit_direction}")
         return False
-
-    # Si se especificaron subswaths que cubren el AOI, filtrar aún más
-    if covering_subswaths:
-        logger.info(f"🔍 Análisis de cobertura: Solo procesar subswaths que cubren el AOI")
-        logger.info(f"   Subswaths con cobertura: {', '.join(sorted(covering_subswaths))}")
-
-        # Filtrar por cobertura
-        config_files_coverage_filtered = []
-        for cf in config_files_filtered:
-            iw = cf.stem.replace("selected_products_", "").split('_')[-1].upper()
-            if iw in covering_subswaths:
-                config_files_coverage_filtered.append(cf)
-            else:
-                skipped_iws.append(iw)
-                logger.info(f"   ⏭️  Saltando {iw} (no cubre el AOI)")
-
-        config_files_filtered = config_files_coverage_filtered
-
-        if not config_files_filtered:
-            logger.error(f"✗ Ningún subswath cubre el AOI para {orbit_direction}")
-            return False
-
-        logger.info(f"   ✓ Subswaths a procesar: {len(config_files_filtered)}")
-        logger.info("")
-
-    logger.info(f"Subswaths a procesar: {len(config_files_filtered)}")
+    
+    logger.info(f"Subswaths a procesar: {len(config_files_filtered)} (IW1, IW2)")
     for cf in config_files_filtered:
         iw = cf.stem.replace("selected_products_", "").split('_')[-1].upper()
         logger.info(f"  - {cf.name} → {iw}")
@@ -807,10 +768,6 @@ def run_processing(project_name, orbit_direction, use_repository=True, save_to_r
     logger.info(f"Total subswaths disponibles: {len(config_files_sorted)}")
     logger.info(f"Procesadas exitosamente: {success_count}")
     logger.info(f"Sin cobertura/fallidas: {failed_count}")
-
-    if skipped_iws:
-        skipped_list = ", ".join(skipped_iws)
-        logger.info(f"⏭️  IWs saltadas (no cubren AOI): {skipped_list}")
 
     if processed_iws:
         iw_list = ", ".join(processed_iws)
@@ -1341,116 +1298,6 @@ def calculate_closure_phase_for_project(project_name, log=None):
         return False
 
 
-def check_subswath_coverage(aoi_file, slc_dir, orbit_direction):
-    """
-    Verifica qué subswaths cubren el AOI basándose en productos SLC descargados.
-
-    Args:
-        aoi_file: Path al archivo GeoJSON del AOI
-        slc_dir: Directorio con productos SLC
-        orbit_direction: DESCENDING o ASCENDING
-
-    Returns:
-        set: Conjunto de subswaths que cubren el AOI (ej: {'IW1', 'IW2'})
-    """
-    try:
-        # Importar función de análisis
-        sys.path.insert(0, str(Path(__file__).parent / 'scripts'))
-        from select_optimal_subswath import analyze_slc_products
-
-        # Analizar productos locales
-        analysis = analyze_slc_products(str(slc_dir), str(aoi_file), verbose=False)
-
-        if not analysis or not analysis.get('products_by_date'):
-            return set()
-
-        # Recopilar subswaths que cubren el AOI
-        subswaths_covering = set()
-        for date, products in analysis['products_by_date'].items():
-            for product in products:
-                # Filtrar por órbita
-                product_path = Path(product['path'])
-                if orbit_direction.lower()[:4] in product_path.name.lower():
-                    subswaths_covering.update(product.get('subswaths_covering_aoi', []))
-
-        # Filtrar solo IW1 e IW2 (excluir IW3 por distorsiones)
-        subswaths_covering = {sw for sw in subswaths_covering if sw in ['IW1', 'IW2']}
-
-        return subswaths_covering
-
-    except Exception as e:
-        logger.warning(f"Error verificando cobertura de subswaths: {e}")
-        # Por defecto, asumir ambos
-        return {'IW1', 'IW2'}
-
-
-def check_smart_workflow_plan(aoi_file, start_date, end_date, orbit_directions):
-    """
-    Consulta el Smart Workflow Planner para determinar qué necesita procesarse.
-
-    Args:
-        aoi_file: Path al archivo GeoJSON
-        start_date: Fecha de inicio
-        end_date: Fecha de fin
-        orbit_directions: Lista de direcciones de órbita
-
-    Returns:
-        dict: Plan de workflow con decisiones por track, o None si BD no disponible
-    """
-    try:
-        planner = SmartWorkflowPlanner()
-
-        if not planner.db_available:
-            print("\n" + "="*80)
-            print("⚠️  BASE DE DATOS NO DISPONIBLE")
-            print("="*80)
-            print("El workflow continuará en modo tradicional (procesa todo)")
-            print("Para habilitar optimización:")
-            print("  1. cd ../satelit_metadata")
-            print("  2. make setup")
-            print("="*80 + "\n")
-            return None
-
-        # Consultar plan
-        decisions = planner.plan_workflow(
-            aoi_geojson=str(aoi_file),
-            start_date=start_date,
-            end_date=end_date,
-            orbit_directions=orbit_directions,
-            subswaths=['IW1', 'IW2']  # Default subswaths
-        )
-
-        # Mostrar plan
-        print("\n" + "="*80)
-        print("🧠 SMART WORKFLOW - ANÁLISIS DE OPTIMIZACIÓN")
-        print("="*80)
-        planner.print_workflow_plan(decisions)
-
-        # Calcular ahorro potencial
-        crop_only = sum(1 for d in decisions.values() if d.needs_crop_only)
-        process_only = sum(1 for d in decisions.values() if d.needs_processing and not d.needs_download)
-        full_workflow = sum(1 for d in decisions.values() if d.needs_download and d.needs_processing)
-
-        if crop_only > 0 or process_only > 0:
-            print("\n" + "="*80)
-            print("⚡ AHORRO POTENCIAL DETECTADO")
-            print("="*80)
-            if crop_only > 0:
-                print(f"  ✂️  {crop_only} track(s) solo necesitan CROP (~15 min c/u)")
-                print(f"     Ahorro estimado: ~{crop_only * 6} horas")
-            if process_only > 0:
-                print(f"  ⚡ {process_only} track(s) solo necesitan PROCESAMIENTO")
-                print(f"     Ahorro estimado: ~{process_only * 1.5} horas (skip download)")
-            print("="*80 + "\n")
-
-        return decisions
-
-    except Exception as e:
-        print(f"\n⚠️  Error consultando Smart Workflow: {e}")
-        print("Continuando en modo tradicional...\n")
-        return None
-
-
 def main():
     global logger
 
@@ -1489,7 +1336,7 @@ def main():
         'project_name': project_name,
         'start_date': start_date,
         'end_date': end_date,
-        'download': True,
+        'download': True, 
         'satellites': ['S1A', 'S1C'],
         'orbit_type': 'POEORB',
         'orbit_direction': ['DESCENDING', 'ASCENDING'],
@@ -1498,34 +1345,6 @@ def main():
         'collection': ['SENTINEL-1', 'SENTINEL-2'],
         'min_coverage': 100.0,
     }
-
-    # 🧠 SMART WORKFLOW: Consultar BD para optimización
-    smart_plan = check_smart_workflow_plan(
-        aoi_file,
-        start_date,
-        end_date,
-        workflow_config['orbit_direction']
-    )
-
-    # Almacenar plan en config para uso posterior
-    workflow_config['smart_plan'] = smart_plan
-
-    # Si hay plan con optimizaciones, pedir confirmación
-    if smart_plan:
-        crop_only = sum(1 for d in smart_plan.values() if d.needs_crop_only)
-        if crop_only > 0:
-            response = input("\n¿Deseas usar las optimizaciones sugeridas? (y/N): ").strip().lower()
-            if response != 'y':
-                print("Continuando en modo tradicional (sin optimizaciones)")
-                workflow_config['smart_plan'] = None
-            else:
-                print("✓ Usando optimizaciones del Smart Workflow\n")
-                workflow_config['use_smart_optimizations'] = True
-        else:
-            print("Continuando con workflow completo (sin optimizaciones detectadas)\n")
-            workflow_config['use_smart_optimizations'] = False
-    else:
-        workflow_config['use_smart_optimizations'] = False
 
     # Mostrar configuración
     logger.info(f"{'=' * 80}")
@@ -1557,30 +1376,8 @@ def main():
         logger.error(f"  El workflow no puede continuar sin datos Sentinel-2")
         print_summary(project_name, success=False, log=logger)
         return 1
-
+    
     workflow_config['download_sentinel2'] = True
-
-    # PASO 2c: Verificar qué subswaths cubren el AOI
-    logger.info(f"{'=' * 80}")
-    logger.info(f"ANÁLISIS DE COBERTURA DE SUBSWATHS")
-    logger.info(f"{'=' * 80}")
-
-    slc_dir = Path("data") / "sentinel1_slc"
-    covering_subswaths_by_orbit = {}
-
-    for orbit_direction in workflow_config['orbit_direction']:
-        covering = check_subswath_coverage(aoi_file, slc_dir, orbit_direction)
-        covering_subswaths_by_orbit[orbit_direction] = covering
-
-        if covering:
-            logger.info(f"✓ Órbita {orbit_direction}: Subswaths que cubren AOI: {', '.join(sorted(covering))}")
-        else:
-            logger.warning(f"⚠ Órbita {orbit_direction}: No se pudo determinar cobertura (se procesarán IW1 e IW2 por defecto)")
-            covering_subswaths_by_orbit[orbit_direction] = {'IW1', 'IW2'}  # Fallback
-
-    workflow_config['covering_subswaths'] = covering_subswaths_by_orbit
-    logger.info(f"{'=' * 80}")
-    logger.info("")
 
     # PASO 3: Crear proyecto AOI
     if create_aoi_project(aoi_file, project_name):
@@ -1606,12 +1403,9 @@ def main():
 
         # PASO 4: Procesar cada serie COMPLETA (InSAR + Stats)
         # Repositorio siempre activo: usa productos existentes y guarda nuevos
-        # Pasar información de cobertura para saltar subswaths que no cubren el AOI
-        covering_for_orbit = workflow_config.get('covering_subswaths', {}).get(orbit_direction)
         orbit_success = run_processing(project_name, orbit_direction=orbit_direction,
                                        use_repository=True,
-                                       save_to_repository=True,
-                                       covering_subswaths=covering_for_orbit)
+                                       save_to_repository=True)
         
         # Evaluar calidad del procesamiento
         quality = evaluate_orbit_processing_quality(project_name, orbit_direction, log=logger)
